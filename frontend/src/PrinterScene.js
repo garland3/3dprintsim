@@ -11,6 +11,32 @@ import { LineMaterial } from 'three/addons/lines/LineMaterial.js';
 // color ramp. Picked by eye — big enough to read, small enough to stay local.
 const GLOW_SEGMENTS = 40;
 
+// Palette for role-based coloring. The viewer's biggest readability problem is
+// that a single-color toolpath turns into an orange blob — the eye can't parse
+// depth or distinguish structural features. We color by role (perimeter / infill
+// / support / overhang) and then blend a Z-height ramp on top so the shape is
+// legible from any angle.
+//
+// Colors are linear RGB triples in [0, 1] because we feed them directly to a
+// LineMaterial with vertexColors enabled.
+const ROLE_BASE = {
+  perimeter:          [0.18, 0.62, 0.95],   // cool cyan/blue: walls
+  overhang_perimeter: [1.00, 0.38, 0.18],   // hot orange: unsupported edges pop
+  infill_sparse:      [0.55, 0.55, 0.62],   // dim grey: interior lattice
+  infill_solid:       [0.95, 0.82, 0.30],   // warm yellow: solid fill
+  bottom:             [0.95, 0.55, 0.20],   // amber: bottom/overhang fills
+  top:                [0.85, 0.90, 0.45],   // pale yellow-green: ceilings
+  support:            [0.35, 0.80, 0.55],   // muted green: easy to subtract visually
+};
+const ROLE_DEFAULT = [0.95, 0.42, 0.18];   // fallback to the old orange
+const HOT_COLOR = [1.0, 0.98, 0.75];       // just-extruded glow
+
+// Depth ramp: each segment's base color is biased brighter as Z grows so the
+// eye reads height even on single-role prints. The shift is small (±20% per
+// channel) to keep role identity intact.
+const DEPTH_LIGHTEN = 0.35;
+const DEPTH_DARKEN = 0.30;
+
 export class PrinterScene {
   constructor(canvas) {
     this.canvas = canvas;
@@ -245,8 +271,9 @@ export class PrinterScene {
       const mat = new THREE.MeshStandardMaterial({
         color: 0x6fb7ff,
         transparent: true,
-        opacity: 0.65,
+        opacity: 0.35,
         side: THREE.DoubleSide,
+        depthWrite: false,
       });
       const mesh = new THREE.Mesh(geom, mat);
       mesh.userData.partId = part.id;
@@ -282,8 +309,12 @@ export class PrinterScene {
     }
 
     // Pre-compute every extrude segment once. The move index is retained so
-    // setCursor can map a simulation cursor back to a segment count.
+    // setCursor can map a simulation cursor back to a segment count. We also
+    // record role + z-height per segment so setCursor can do role+depth
+    // coloring without re-reading the moves array every frame.
     const segs = [];
+    let zMin = Infinity;
+    let zMax = -Infinity;
     for (let i = 0; i < moves.length - 1; i++) {
       const a = moves[i];
       const b = moves[i + 1];
@@ -293,9 +324,15 @@ export class PrinterScene {
         moveIndex: i + 1,
         ax: a.x, ay: a.z, az: a.y,
         bx: b.x, by: b.z, bz: b.y,
+        role: b.role || 'perimeter',
+        z: b.z,
       });
+      if (b.z < zMin) zMin = b.z;
+      if (b.z > zMax) zMax = b.z;
     }
     this._extrudeSegments = segs;
+    this._zMin = isFinite(zMin) ? zMin : 0;
+    this._zRange = isFinite(zMax - zMin) && zMax > zMin ? (zMax - zMin) : 1;
 
     const rect = this.canvas.getBoundingClientRect();
     const resW = Math.max(1, Math.floor(rect.width));
@@ -360,32 +397,56 @@ export class PrinterScene {
       else break;
     }
 
-    // Fill positions + color ramp; the last GLOW_SEGMENTS get a hot-deposit
-    // color that fades into the settled filament tone. We write into our
-    // reusable scratch arrays, then build a fresh LineSegmentsGeometry whose
-    // size matches the visible prefix.
+    // Fill positions + a role-aware, depth-aware color ramp. The last
+    // GLOW_SEGMENTS blend toward a near-white hot color so the active extrusion
+    // stands out. Earlier segments get their role's base color biased by Z
+    // height (lighter at the top, darker at the bottom) — this is what gives
+    // the print visible shape instead of an orange blob.
     const pos = this._printedPositions;
     const col = this._printedColors;
-    const deposited = [0.95, 0.42, 0.18]; // settled filament: orange
-    const hot = [1.0, 0.95, 0.55];        // just-deposited: near-white yellow
+    const zMin = this._zMin ?? 0;
+    const zRange = this._zRange ?? 1;
     for (let i = 0; i < visibleSegs; i++) {
       const s = segs[i];
       const o = i * 6;
       pos[o] = s.ax; pos[o + 1] = s.ay; pos[o + 2] = s.az;
       pos[o + 3] = s.bx; pos[o + 4] = s.by; pos[o + 5] = s.bz;
 
+      const base = ROLE_BASE[s.role] || ROLE_DEFAULT;
+      // Normalize Z within the toolpath's own range; center at 0.5 so the
+      // mid-layers are unshifted and only the ceiling/floor get the extreme
+      // tints. shift ∈ [-0.5, +0.5].
+      const zNorm = Math.max(0, Math.min(1, (s.z - zMin) / zRange));
+      const shift = zNorm - 0.5;
+      const liftAmt = shift > 0 ? shift * 2 * DEPTH_LIGHTEN : 0;
+      const sinkAmt = shift < 0 ? -shift * 2 * DEPTH_DARKEN : 0;
+      let r = base[0] * (1 - sinkAmt) + (1 - base[0]) * liftAmt;
+      let g = base[1] * (1 - sinkAmt) + (1 - base[1]) * liftAmt;
+      let b = base[2] * (1 - sinkAmt) + (1 - base[2]) * liftAmt;
+
       const fromEnd = visibleSegs - 1 - i;
-      const t = fromEnd < GLOW_SEGMENTS ? 1 - fromEnd / GLOW_SEGMENTS : 0;
-      const r = deposited[0] + (hot[0] - deposited[0]) * t;
-      const g = deposited[1] + (hot[1] - deposited[1]) * t;
-      const b = deposited[2] + (hot[2] - deposited[2]) * t;
+      if (fromEnd < GLOW_SEGMENTS) {
+        const t = 1 - fromEnd / GLOW_SEGMENTS;
+        r = r + (HOT_COLOR[0] - r) * t;
+        g = g + (HOT_COLOR[1] - g) * t;
+        b = b + (HOT_COLOR[2] - b) * t;
+      }
       col[o] = r; col[o + 1] = g; col[o + 2] = b;
       col[o + 3] = r; col[o + 4] = g; col[o + 5] = b;
     }
 
-    // During simulation hide the translucent source mesh so the fresh filament
-    // is the only thing on screen; when reset to cursor 0 the mesh reappears.
-    this.partsGroup.visible = visibleSegs === 0;
+    // Keep the source mesh visible at low opacity during simulation. Hiding
+    // it entirely made the running print look like a floating orange blob
+    // with no shape cue — the translucent mesh gives the eye a reference.
+    this.partsGroup.visible = true;
+    const meshOpacity = visibleSegs === 0 ? 0.35 : 0.12;
+    for (const child of this.partsGroup.children) {
+      if (child.material && child.material.opacity !== meshOpacity) {
+        child.material.opacity = meshOpacity;
+        child.material.transparent = true;
+        child.material.depthWrite = false;
+      }
+    }
 
     this._disposeGroup(this.printedGroup);
     this.printedGroup.clear();

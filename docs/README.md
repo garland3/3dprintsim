@@ -12,6 +12,8 @@ goes deeper.
 | [`infill-and-render.md`](./infill-and-render.md) | What infill + solid top/bottom do, how the thick glowing toolpath renders, and how auto-centering works. |
 | [`architecture.md`](./architecture.md) | How the backend, MCP server, and Three.js frontend share one printer. |
 | [`slicer.md`](./slicer.md) | The Z-plane slicer algorithm and G-code generation. |
+| [`surfaces-and-supports.md`](./surfaces-and-supports.md) | Raster-based top/bottom/overhang detection and auto-generated supports. |
+| [`depth-visualization.md`](./depth-visualization.md) | How role + Z-height coloring turns an "orange blob" into a legible 3D print. |
 | [`api.md`](./api.md) | HTTP API reference with example `curl` calls. |
 | [`mcp.md`](./mcp.md) | MCP tool surface and an example `fastmcp` client. |
 | [`frontend.md`](./frontend.md) | Three.js scene, coordinate conventions, UI wiring. |
@@ -32,7 +34,11 @@ shots (10–15) were captured during the infill + glow-render work.
 | ![auto-center](./screenshots/13-auto-centered-upload.png) | A freshly uploaded 20 mm cube, dropped straight onto the middle of a 250 × 210 bed (the placement's min-corner is (115, 95), so the cube is centered). |
 | ![slice summary](./screenshots/14-slice-with-infill-stats.png) | Slice panel after clicking **Slice** — 51 layers, 1851 moves, 720 mm of filament from 20% infill plus 3 solid top/bottom layers. |
 | ![empty bed](./screenshots/15-empty-bed-infill-ui.png) | Initial app state. The new Slicer panel exposes `Infill %`, `Top`, and `Bot.` inputs. |
+| ![tshape supports](./screenshots/16-tshape-supports.png) | A T-shape with overhanging cap (20×10×20 mm). The cap's bottom is flagged as a bottom surface (solid amber fill); the mid-section shows green support columns underneath the overhang. |
+| ![depth coloring](./screenshots/17-depth-colored-toolpath.png) | Same cube as before but with the new role + Z-height color ramp — blue perimeters, yellow solid top, grey sparse infill all read as distinct features instead of one orange blob. |
+| ![legend](./screenshots/18-legend-overview.png) | The overlay legend in the bottom-left tells the user what each color means. |
 
 See [`getting-started.md`](./getting-started.md) for the narrated tour through
-the original (01–09) pipeline shots, and [`infill-and-render.md`](./infill-and-render.md)
-for detail on what each new feature does.
+the original (01–09) pipeline shots, [`infill-and-render.md`](./infill-and-render.md)
+for detail on infill + glow rendering, and [`surfaces-and-supports.md`](./surfaces-and-supports.md)
+for the overhang detection and support generation pipeline.

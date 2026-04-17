@@ -10,6 +10,7 @@ dependencies = [
     "numpy>=1.26",
     "numpy-stl>=3.1",
     "fastmcp>=2.0",
+    "httpx>=0.27",
 ]
 
 [dependency-groups]

@@ -13,12 +13,13 @@ and a human share one virtual printer.
 |---|---|---|
 | `get_printer_state` | — | Full printer snapshot (same as `GET /api/state`). |
 | `set_bed_size` | `x_mm`, `y_mm`, `z_mm` | Printer state after resize. |
-| `upload_stl` | `name`, `stl_base64` | New part metadata. |
+| `upload_stl` | `name`, `stl_base64` | New part metadata (base64-in-tool-call upload). |
+| `atlas_upload` | `filename`, `name?`, `scale=1.0` | New part metadata (downloads an Atlas-hosted STL by URL — preferred for real-world parts). |
 | `list_parts` | — | All parts. |
 | `remove_part` | `part_id` | `{ok: true, removed}` |
 | `clear_parts` | — | `{ok: true}` |
 | `auto_arrange` | — | List of placements. |
-| `slice_all` | `layer_height_mm=0.4`, `perimeters=1` | Slice summary. |
+| `slice_all` | `layer_height_mm=0.4`, `perimeters=1`, `infill_density=0.2`, `top_layers=3`, `bottom_layers=3`, `support_density=0.25` | Slice summary (includes `support_cell_count`). |
 | `get_gcode` | — | Latest G-code as a string. |
 | `start_simulation` | `speed=1.0` | `{running, cursor, speed}` |
 | `step_simulation` | `steps=1` | `{running, cursor, total_moves}` |
@@ -73,3 +74,30 @@ will see every action reflected live:
 See the E2E test at
 [`tests/e2e/mcp.spec.js`](../tests/e2e/mcp.spec.js) for a passing example
 that asserts this mirrored-state behaviour.
+
+## Atlas file uploads
+
+Real-world STLs run 1–50 MB; base64-encoding one into a tool call blows up
+the prompt and the model's context window. Atlas-compatible hosts solve
+this by stashing uploaded files in a signed vault and handing a download
+URL to the tool as the `filename` argument.
+
+The `atlas_upload` tool fetches that URL, feeds the bytes into the same
+`add_part_from_bytes()` path `upload_stl` uses, and returns the new part's
+metadata. The URL may be absolute (`https://atlas.example.com/mcp/files/...`)
+or a relative path (`/mcp/files/download/abc123?token=xyz`); relative paths
+are resolved against the `BACKEND_PUBLIC_URL` env var (defaults to
+`http://localhost:8000`).
+
+```python
+await client.call_tool("atlas_upload", {
+    "filename": "/mcp/files/download/abc123?token=xyz",
+    "name": "bracket.stl",   # optional override; otherwise derived from URL
+    "scale": 1.0,            # 25.4 for inches, 0.001 for metres
+})
+```
+
+Failures are surfaced as clean `ValueError`s — a 404 from Atlas, a
+truncated stream, or a file over the 200 MiB cap all raise without leaving
+a half-loaded part in the state. Coverage lives in
+[`backend/tests/test_atlas_upload.py`](../backend/tests/test_atlas_upload.py).

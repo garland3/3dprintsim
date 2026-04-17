@@ -239,6 +239,7 @@ class PrinterService:
         top_layers: int = 3,
         bottom_layers: int = 3,
         nozzle_width: float = 0.4,
+        support_density: float = 0.25,
     ) -> SliceResult:
         with self._lock:
             if not self.parts:
@@ -256,6 +257,7 @@ class PrinterService:
                 top_layers=top_layers,
                 bottom_layers=bottom_layers,
                 nozzle_width=nozzle_width,
+                support_density=support_density,
             )
             self.slice_result = result
             self.simulation = Simulation(running=False, cursor=0, speed=self.simulation.speed)

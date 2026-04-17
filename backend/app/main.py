@@ -32,6 +32,7 @@ class SliceRequest(BaseModel):
     top_layers: int = Field(3, ge=0)
     bottom_layers: int = Field(3, ge=0)
     nozzle_width: float = Field(0.4, gt=0)
+    support_density: float = Field(0.25, ge=0.0, le=1.0)
 
 
 class SimulationStartRequest(BaseModel):
@@ -168,6 +169,7 @@ def create_app() -> FastAPI:
                 top_layers=req.top_layers,
                 bottom_layers=req.bottom_layers,
                 nozzle_width=req.nozzle_width,
+                support_density=req.support_density,
             )
         except ArrangeError as exc:
             # slice_all() implicitly auto-arranges unplaced parts; surface bed
