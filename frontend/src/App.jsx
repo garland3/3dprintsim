@@ -291,6 +291,11 @@ export default function App() {
     <div className="app">
       <aside className="sidebar" data-testid="sidebar">
         <h1>3D Print Sim</h1>
+        {api.isEmbedded && (
+          <div className="session-badge" data-testid="session-badge" title={`MCP session ${api.sessionId}`}>
+            Atlas · session {api.sessionId.slice(0, 8)}…
+          </div>
+        )}
         {error && <div className="error" data-testid="error">{error}</div>}
 
         <h2>Bed</h2>

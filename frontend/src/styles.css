@@ -37,6 +37,17 @@ body {
 }
 
 h1 { font-size: 18px; margin: 0 0 12px; }
+.session-badge {
+  display: inline-block;
+  padding: 4px 8px;
+  margin: 0 0 12px;
+  background: #1a2330;
+  color: #7bb4ff;
+  border: 1px solid #294159;
+  border-radius: 4px;
+  font-size: 11px;
+  font-family: ui-monospace, "SF Mono", Consolas, monospace;
+}
 h2 { font-size: 14px; margin: 18px 0 8px; color: #8b9299; text-transform: uppercase; letter-spacing: 1px; }
 
 .row { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }

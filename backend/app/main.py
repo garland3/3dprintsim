@@ -1,22 +1,32 @@
 """FastAPI application exposing the virtual printer to HTTP clients.
 
-The same PrinterService is also exposed via fastmcp at /mcp, so an AI agent
-and the React UI share a single virtual printer.
+The same per-session PrinterService is also exposed via fastmcp at /mcp, so an
+AI agent and the React UI share one virtual printer — but only within the same
+session. See state.py for the registry keying.
+
+Session resolution precedence (first match wins):
+  1. `X-Session-Id` HTTP header (what the React frontend sends after reading
+     its query param)
+  2. `session` query parameter (for the very first page load before JS wires
+     the header middleware up)
+  3. A sentinel "default" session (for tests / dev clients with no session)
 """
 
 from __future__ import annotations
 
 import contextlib
+import os
 from dataclasses import asdict
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, Response
 from pydantic import BaseModel, Field
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from .arrange import ArrangeError
 from .mcp_server import build_mcp
-from .state import get_service, reset_service
+from .state import DEFAULT_SESSION_ID, PrinterService, get_service, reset_service
 
 
 class BedSize(BaseModel):
@@ -51,6 +61,54 @@ class PartScaleRequest(BaseModel):
     scale: float = Field(gt=0)
 
 
+def _session_id(request: Request, session: str | None = Query(default=None)) -> str:
+    """Resolve the caller's session id from header-then-query, defaulting to
+    the shared "default" session when neither is provided.
+    """
+    header = request.headers.get("x-session-id")
+    if header:
+        return header
+    if session:
+        return session
+    return DEFAULT_SESSION_ID
+
+
+def session_service(
+    request: Request,
+    session: str | None = Query(default=None),
+) -> PrinterService:
+    """FastAPI dependency — returns the PrinterService for the caller's session."""
+    return get_service(_session_id(request, session))
+
+
+class IframeEmbedMiddleware(BaseHTTPMiddleware):
+    """Allow the frontend to be rendered inside Atlas's canvas iframe.
+
+    FastAPI doesn't set X-Frame-Options by default, but many reverse-proxies
+    upstream of it do. We explicitly set a permissive `Content-Security-Policy:
+    frame-ancestors` (and strip `X-Frame-Options` if anything upstream added it)
+    so any Atlas deployment — or the user's own same-origin SPA — can embed us.
+
+    `FRAME_ANCESTORS` lets operators lock this down further without code
+    changes; the default (`*`) is fine for a dev-focused simulator.
+    """
+
+    def __init__(self, app, frame_ancestors: str = "*") -> None:
+        super().__init__(app)
+        self.frame_ancestors = frame_ancestors
+
+    async def dispatch(self, request: Request, call_next):
+        response: Response = await call_next(request)
+        response.headers["Content-Security-Policy"] = (
+            f"frame-ancestors {self.frame_ancestors}"
+        )
+        # Some WSGI frontends inject X-Frame-Options=DENY by default; strip it
+        # so browsers fall back to CSP frame-ancestors instead.
+        if "x-frame-options" in response.headers:
+            del response.headers["x-frame-options"]
+        return response
+
+
 def create_app() -> FastAPI:
     mcp = build_mcp()
     mcp_app = mcp.http_app(path="/")
@@ -63,7 +121,7 @@ def create_app() -> FastAPI:
     app = FastAPI(
         title="3dprintsim",
         version="0.1.0",
-        description="Virtual FDM printer simulator with MCP support.",
+        description="Virtual FDM printer simulator with stateful per-session MCP support.",
         lifespan=lifespan,
     )
 
@@ -71,7 +129,14 @@ def create_app() -> FastAPI:
         CORSMiddleware,
         allow_origins=["*"],
         allow_methods=["*"],
-        allow_headers=["*"],
+        # Atlas needs the session header to reach us; explicit allow is safer
+        # than `*` because some browsers disallow `*` with credentialed calls.
+        allow_headers=["*", "X-Session-Id"],
+        expose_headers=["X-Session-Id"],
+    )
+    app.add_middleware(
+        IframeEmbedMiddleware,
+        frame_ancestors=os.getenv("FRAME_ANCESTORS", "*"),
     )
 
     app.mount("/mcp", mcp_app)
@@ -80,23 +145,35 @@ def create_app() -> FastAPI:
     def health() -> dict:
         return {"ok": True, "service": "3dprintsim"}
 
+    @app.get("/api/session")
+    def session_info(request: Request, session: str | None = Query(default=None)) -> dict:
+        """Echo the resolved session id so a fresh iframe can confirm wiring.
+
+        Useful for debugging Atlas embeds: the frontend pings this on boot and
+        surfaces any mismatch between the URL param and what the backend saw.
+        """
+        sid = _session_id(request, session)
+        return {"session_id": sid, "is_default": sid == DEFAULT_SESSION_ID}
+
     @app.get("/api/state")
-    def state() -> dict:
-        return get_service().get_state()
+    def state(svc: PrinterService = Depends(session_service)) -> dict:
+        return svc.get_state()
 
     @app.post("/api/reset")
-    def reset() -> dict:
-        reset_service()
-        return get_service().get_state()
+    def reset(request: Request, session: str | None = Query(default=None)) -> dict:
+        sid = _session_id(request, session)
+        reset_service(sid)
+        return get_service(sid).get_state()
 
     @app.post("/api/bed")
-    def set_bed(body: BedSize) -> dict:
-        return get_service().set_bed_size(body.x, body.y, body.z)
+    def set_bed(body: BedSize, svc: PrinterService = Depends(session_service)) -> dict:
+        return svc.set_bed_size(body.x, body.y, body.z)
 
     @app.post("/api/parts/upload")
     async def upload(
         file: UploadFile = File(...),
         scale: float = Form(1.0),
+        svc: PrinterService = Depends(session_service),
     ) -> dict:
         """Upload an STL.
 
@@ -105,7 +182,7 @@ def create_app() -> FastAPI:
         """
         data = await file.read()
         try:
-            part = get_service().add_part_from_bytes(
+            part = svc.add_part_from_bytes(
                 file.filename or "part.stl", data, scale=scale
             )
         except ValueError as exc:
@@ -113,9 +190,13 @@ def create_app() -> FastAPI:
         return part.to_public()
 
     @app.post("/api/parts/{part_id}/scale")
-    def set_part_scale(part_id: str, body: PartScaleRequest) -> dict:
+    def set_part_scale(
+        part_id: str,
+        body: PartScaleRequest,
+        svc: PrinterService = Depends(session_service),
+    ) -> dict:
         try:
-            part = get_service().set_part_scale(part_id, body.scale)
+            part = svc.set_part_scale(part_id, body.scale)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
@@ -123,33 +204,39 @@ def create_app() -> FastAPI:
         return part.to_public()
 
     @app.get("/api/parts")
-    def list_parts() -> list[dict]:
-        return [p.to_public() for p in get_service().parts.values()]
+    def list_parts(svc: PrinterService = Depends(session_service)) -> list[dict]:
+        return [p.to_public() for p in svc.parts.values()]
 
     @app.get("/api/parts/{part_id}/geometry")
-    def part_geometry(part_id: str) -> dict:
+    def part_geometry(
+        part_id: str,
+        svc: PrinterService = Depends(session_service),
+    ) -> dict:
         try:
-            return get_service().get_part_geometry(part_id)
+            return svc.get_part_geometry(part_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.delete("/api/parts/{part_id}")
-    def delete_part(part_id: str) -> dict:
+    def delete_part(
+        part_id: str,
+        svc: PrinterService = Depends(session_service),
+    ) -> dict:
         try:
-            get_service().remove_part(part_id)
+            svc.remove_part(part_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         return {"ok": True}
 
     @app.post("/api/parts/clear")
-    def clear_parts() -> dict:
-        get_service().clear_parts()
+    def clear_parts(svc: PrinterService = Depends(session_service)) -> dict:
+        svc.clear_parts()
         return {"ok": True}
 
     @app.post("/api/arrange")
-    def arrange_parts() -> dict:
+    def arrange_parts(svc: PrinterService = Depends(session_service)) -> dict:
         try:
-            placements = get_service().auto_arrange()
+            placements = svc.auto_arrange()
         except ArrangeError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {
@@ -160,9 +247,12 @@ def create_app() -> FastAPI:
         }
 
     @app.post("/api/slice")
-    def slice_all(req: SliceRequest) -> dict:
+    def slice_all(
+        req: SliceRequest,
+        svc: PrinterService = Depends(session_service),
+    ) -> dict:
         try:
-            result = get_service().slice_all(
+            result = svc.slice_all(
                 layer_height=req.layer_height,
                 perimeters=req.perimeters,
                 infill_density=req.infill_density,
@@ -180,52 +270,60 @@ def create_app() -> FastAPI:
         return result.summary()
 
     @app.get("/api/slice")
-    def get_slice() -> dict:
-        return get_service().get_slice_payload()
+    def get_slice(svc: PrinterService = Depends(session_service)) -> dict:
+        return svc.get_slice_payload()
 
     @app.get("/api/gcode", response_class=PlainTextResponse)
-    def get_gcode() -> str:
-        svc = get_service()
+    def get_gcode(svc: PrinterService = Depends(session_service)) -> str:
         if svc.slice_result is None:
             raise HTTPException(status_code=400, detail="slice first")
         return svc.slice_result.gcode
 
     @app.post("/api/simulation/start")
-    def start_sim(req: SimulationStartRequest) -> dict:
+    def start_sim(
+        req: SimulationStartRequest,
+        svc: PrinterService = Depends(session_service),
+    ) -> dict:
         try:
-            sim = get_service().start_simulation(speed=req.speed)
+            sim = svc.start_simulation(speed=req.speed)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return asdict(sim)
 
     @app.post("/api/simulation/step")
-    def step_sim(req: SimulationStepRequest) -> dict:
+    def step_sim(
+        req: SimulationStepRequest,
+        svc: PrinterService = Depends(session_service),
+    ) -> dict:
         try:
-            sim = get_service().step_simulation(steps=req.steps)
+            sim = svc.step_simulation(steps=req.steps)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return asdict(sim)
 
     @app.post("/api/simulation/cursor")
-    def cursor_sim(req: SimulationCursorRequest) -> dict:
+    def cursor_sim(
+        req: SimulationCursorRequest,
+        svc: PrinterService = Depends(session_service),
+    ) -> dict:
         try:
-            sim = get_service().set_simulation_cursor(req.cursor)
+            sim = svc.set_simulation_cursor(req.cursor)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return asdict(sim)
 
     @app.get("/api/simulation/frame")
-    def sim_frame() -> dict:
-        return get_service().get_simulation_frame()
+    def sim_frame(svc: PrinterService = Depends(session_service)) -> dict:
+        return svc.get_simulation_frame()
 
     @app.get("/api/viewer/requests")
-    def viewer_requests() -> dict:
+    def viewer_requests(svc: PrinterService = Depends(session_service)) -> dict:
         """Tiny polling endpoint: returns one-shot UI request counters."""
-        return get_service().get_viewer_requests()
+        return svc.get_viewer_requests()
 
     @app.post("/api/viewer/focus")
-    def request_focus() -> dict:
-        return {"focus_request": get_service().request_focus()}
+    def request_focus(svc: PrinterService = Depends(session_service)) -> dict:
+        return {"focus_request": svc.request_focus()}
 
     return app
 

@@ -1,11 +1,16 @@
 # MCP server
 
-Served at `http://127.0.0.1:8000/mcp/` (streamable-HTTP). Built with
-[`fastmcp`](https://gofastmcp.com/). Definitions live in
+Served at `http://127.0.0.1:8000/mcp/` (streamable-HTTP, stateful). Built with
+[`fastmcp`](https://gofastmcp.com/) 3.2+. Definitions live in
 [`backend/app/mcp_server.py`](../backend/app/mcp_server.py).
 
-The server exposes the same `PrinterService` the HTTP API uses, so an agent
-and a human share one virtual printer.
+The server is **stateful per session**: every MCP client (one per Atlas
+conversation, because Atlas mints one session per `(user, server)` pair) gets
+its own `PrinterService` via the `SessionRegistry` in `backend/app/state.py`.
+Different users never see each other's parts — but the same user's browser
+iframe and AI agent *do* share state, because the viewer iframe URL carries
+the MCP session id as `?session=<id>` and the frontend stamps every REST call
+with `X-Session-Id: <id>`.
 
 ## Tools
 
@@ -25,12 +30,15 @@ and a human share one virtual printer.
 | `step_simulation` | `steps=1` | `{running, cursor, total_moves}` |
 | `set_simulation_cursor` | `cursor` | `{running, cursor, total_moves}` |
 | `get_simulation_frame` | — | `{cursor, total_moves, running, head, extruded_moves}` |
+| `focus_viewer` | — | Bumps the camera-focus counter the browser polls. |
+| `open_viewer` | `title?` | Atlas v2 envelope that opens the live 3D canvas in the Atlas side panel (see below). |
 
 Server instructions (returned by `list_tools` metadata):
 
 > Typical flow: `set_bed_size` → `upload_stl` (one or more) → `auto_arrange`
 > → `slice_all` → `start_simulation` → `step_simulation` until finished.
-> Use `get_printer_state` at any time to inspect.
+> Call `open_viewer` early to pop the live 3D canvas into the Atlas UI so the
+> user can watch the print. Use `get_printer_state` at any time to inspect.
 
 ## Example client
 
@@ -74,6 +82,63 @@ will see every action reflected live:
 See the E2E test at
 [`tests/e2e/mcp.spec.js`](../tests/e2e/mcp.spec.js) for a passing example
 that asserts this mirrored-state behaviour.
+
+## Live viewer in Atlas (iframe)
+
+`open_viewer` returns the [Atlas UI canvas envelope](https://github.com/sandialabs/atlas-ui-3/blob/main/docs/developer/canvas-renderers.md)
+so the agent can pop the live 3D simulator into the side panel without
+asking the user to copy a URL:
+
+```python
+await client.call_tool("open_viewer", {"title": "Printer — live view"})
+```
+
+Returns (via `result.structured_content`):
+
+```json
+{
+  "results": {"content": "...", "session_id": "<mcp session>", "url": "..."},
+  "artifacts": [],
+  "display": {
+    "open_canvas": true,
+    "type": "iframe",
+    "url": "https://<VIEWER_PUBLIC_URL>/?embed=1&session=<mcp session>",
+    "title": "Printer — live view",
+    "sandbox": "allow-scripts allow-same-origin allow-downloads",
+    "mode": "replace"
+  }
+}
+```
+
+The iframe URL carries the agent's **MCP session id**, and the frontend
+sends that same id as the `X-Session-Id` header on every REST call, so every
+`upload_stl` / `slice_all` / `step_simulation` tool call the agent makes
+appears live in the embedded canvas.
+
+### Deployment knobs
+
+- `VIEWER_PUBLIC_URL` — origin the iframe URL points at. Defaults to
+  `BACKEND_PUBLIC_URL` (same origin as the MCP server). Override for split
+  deploys where the Atlas host reaches the frontend on a different domain
+  than its own MCP backend.
+- `FRAME_ANCESTORS` — `Content-Security-Policy: frame-ancestors` value.
+  Defaults to `*`; tighten to your Atlas origin (e.g. `https://atlas.example.com`)
+  in production.
+- `SESSION_TTL_SECONDS` — idle timeout after which a session's
+  `PrinterService` is garbage-collected. Default `3600` (1 hour).
+
+### Atlas CSP allowlist
+
+Atlas enforces its own CSP on iframe `src` values. Add the viewer origin to
+Atlas's `SECURITY_CSP_VALUE` `frame-src` directive:
+
+```bash
+# In the Atlas deployment env:
+SECURITY_CSP_VALUE="... frame-src 'self' https://sim.example.com; ..."
+```
+
+Without this Atlas will silently blank the iframe and the browser console
+will show a CSP violation.
 
 ## Atlas file uploads
 

@@ -3,6 +3,14 @@
 The tools intentionally cover the full pipeline — upload, arrange, slice,
 simulate, introspect — so an agent can operate the printer end to end without
 ever opening the web UI.
+
+Every tool is scoped to the caller's MCP session. FastMCP 3.x's streamable
+HTTP transport mints a session id per client and surfaces it via
+`Context.session_id`; we use that id to key into the SessionRegistry so each
+Atlas conversation gets its own virtual printer. The matching browser iframe
+receives the same id in its URL (see `open_viewer`) and sends it as the
+`X-Session-Id` header on every REST call, keeping the LLM's view of the
+printer and the user's view in sync — without either leaking across users.
 """
 
 from __future__ import annotations
@@ -13,9 +21,9 @@ import socket
 from urllib.parse import urljoin, urlparse
 
 import httpx
-from fastmcp import FastMCP
+from fastmcp import Context, FastMCP
 
-from .state import get_service
+from .state import DEFAULT_SESSION_ID, PrinterService, get_service
 
 
 # Atlas file-upload handoff: when an Atlas host injects a file into an MCP call
@@ -32,6 +40,16 @@ def _backend_public_url() -> str:
     """Resolved at call time so tests can flip BACKEND_PUBLIC_URL per-case
     without having to reload this module."""
     return os.getenv("BACKEND_PUBLIC_URL", "http://localhost:8000")
+
+
+def _viewer_public_url() -> str:
+    """Where the React viewer is served from when embedded in an iframe.
+
+    Defaults to the backend URL (same origin in prod because the backend
+    serves the built frontend), but the dev setup runs the Vite dev server on
+    port 5173 so operators can override via VIEWER_PUBLIC_URL.
+    """
+    return os.getenv("VIEWER_PUBLIC_URL", _backend_public_url())
 
 
 def _normalize_atlas_url(filename: str) -> str:
@@ -118,6 +136,27 @@ def _atlas_display_name(url: str, fallback: str = "atlas.stl") -> str:
     return fallback
 
 
+def _session_id(ctx: Context | None) -> str:
+    """Resolve the active MCP session id, falling back to the shared default.
+
+    ctx.session_id raises if the handshake hasn't completed (e.g. during
+    middleware) and is simply absent when tools are called in-process (tests,
+    agent harnesses). Either way we fall back to DEFAULT_SESSION_ID so the
+    tool still does the right thing for single-user dev setups.
+    """
+    if ctx is None:
+        return DEFAULT_SESSION_ID
+    try:
+        sid = ctx.session_id
+    except (RuntimeError, AttributeError):
+        return DEFAULT_SESSION_ID
+    return sid or DEFAULT_SESSION_ID
+
+
+def _svc(ctx: Context | None) -> PrinterService:
+    return get_service(_session_id(ctx))
+
+
 def build_mcp() -> FastMCP:
     mcp = FastMCP(
         name="3dprintsim",
@@ -125,23 +164,26 @@ def build_mcp() -> FastMCP:
             "Tools for driving a virtual FDM 3D printer. Typical flow: "
             "set_bed_size → upload_stl (one or more) → auto_arrange → "
             "slice_all → start_simulation → step_simulation until finished. "
-            "Use get_printer_state at any time to inspect."
+            "Call open_viewer early to pop the live 3D canvas into the Atlas "
+            "UI so the user can watch the print. Use get_printer_state at "
+            "any time to inspect."
         ),
     )
 
     @mcp.tool
-    def get_printer_state() -> dict:
+    def get_printer_state(ctx: Context) -> dict:
         """Return bed size, loaded parts, slice summary, and simulation cursor."""
-        return get_service().get_state()
+        return _svc(ctx).get_state()
 
     @mcp.tool
-    def set_bed_size(x_mm: float, y_mm: float, z_mm: float) -> dict:
+    def set_bed_size(x_mm: float, y_mm: float, z_mm: float, ctx: Context) -> dict:
         """Resize the virtual print bed. Defaults to Prusa i3-style 250x210x210mm."""
-        return get_service().set_bed_size(x_mm, y_mm, z_mm)
+        return _svc(ctx).set_bed_size(x_mm, y_mm, z_mm)
 
     @mcp.tool
     def atlas_upload(
         filename: str,
+        ctx: Context,
         name: str = "",
         scale: float = 1.0,
     ) -> dict:
@@ -192,46 +234,46 @@ def build_mcp() -> FastMCP:
             raise ValueError(f"Atlas download failed: {exc}") from exc
 
         display_name = name.strip() if name and name.strip() else _atlas_display_name(url)
-        part = get_service().add_part_from_bytes(display_name, data, scale=scale)
+        part = _svc(ctx).add_part_from_bytes(display_name, data, scale=scale)
         return part.to_public()
 
     @mcp.tool
-    def upload_stl(name: str, stl_base64: str, scale: float = 1.0) -> dict:
+    def upload_stl(name: str, stl_base64: str, ctx: Context, scale: float = 1.0) -> dict:
         """Upload an STL file as base64 bytes. Returns the new part's metadata.
 
         `scale` is a linear multiplier applied to every vertex at import — pass
         25.4 for an STL authored in inches, 0.001 for metres, etc.
         """
-        part = get_service().add_part_from_base64(name, stl_base64, scale=scale)
+        part = _svc(ctx).add_part_from_base64(name, stl_base64, scale=scale)
         return part.to_public()
 
     @mcp.tool
-    def set_part_scale(part_id: str, scale: float) -> dict:
+    def set_part_scale(part_id: str, scale: float, ctx: Context) -> dict:
         """Resize a loaded part by a linear scale factor (e.g. 2.0 doubles every dimension)."""
-        part = get_service().set_part_scale(part_id, scale)
+        part = _svc(ctx).set_part_scale(part_id, scale)
         return part.to_public()
 
     @mcp.tool
-    def list_parts() -> list[dict]:
+    def list_parts(ctx: Context) -> list[dict]:
         """List all loaded parts."""
-        return [p.to_public() for p in get_service().parts.values()]
+        return [p.to_public() for p in _svc(ctx).parts.values()]
 
     @mcp.tool
-    def remove_part(part_id: str) -> dict:
+    def remove_part(part_id: str, ctx: Context) -> dict:
         """Remove a part by id."""
-        get_service().remove_part(part_id)
+        _svc(ctx).remove_part(part_id)
         return {"ok": True, "removed": part_id}
 
     @mcp.tool
-    def clear_parts() -> dict:
+    def clear_parts(ctx: Context) -> dict:
         """Remove all parts from the bed."""
-        get_service().clear_parts()
+        _svc(ctx).clear_parts()
         return {"ok": True}
 
     @mcp.tool
-    def auto_arrange() -> list[dict]:
+    def auto_arrange(ctx: Context) -> list[dict]:
         """Pack all loaded parts onto the bed using a shelf packer. Returns placements."""
-        placements = get_service().auto_arrange()
+        placements = _svc(ctx).auto_arrange()
         return [
             {"part_id": p.part_id, "x": p.x, "y": p.y, "rotation_deg": p.rotation_deg}
             for p in placements
@@ -239,6 +281,7 @@ def build_mcp() -> FastMCP:
 
     @mcp.tool
     def slice_all(
+        ctx: Context,
         layer_height_mm: float = 0.4,
         perimeters: int = 1,
         infill_density: float = 0.2,
@@ -256,7 +299,7 @@ def build_mcp() -> FastMCP:
         support_density (0..1) controls how dense the auto-generated support
         columns are — set to 0 to disable supports entirely.
         """
-        result = get_service().slice_all(
+        result = _svc(ctx).slice_all(
             layer_height=layer_height_mm,
             perimeters=perimeters,
             infill_density=infill_density,
@@ -268,17 +311,17 @@ def build_mcp() -> FastMCP:
         return result.summary()
 
     @mcp.tool
-    def get_gcode() -> str:
+    def get_gcode(ctx: Context) -> str:
         """Return the latest slice's G-code as a string."""
-        svc = get_service()
+        svc = _svc(ctx)
         if svc.slice_result is None:
             raise ValueError("slice first")
         return svc.slice_result.gcode
 
     @mcp.tool
-    def start_simulation(speed: float = 1.0) -> dict:
+    def start_simulation(ctx: Context, speed: float = 1.0) -> dict:
         """Start/reset the simulation cursor at 0. Returns simulation state."""
-        sim = get_service().start_simulation(speed=speed)
+        sim = _svc(ctx).start_simulation(speed=speed)
         return {
             "running": sim.running,
             "cursor": sim.cursor,
@@ -286,10 +329,10 @@ def build_mcp() -> FastMCP:
         }
 
     @mcp.tool
-    def step_simulation(steps: int = 1) -> dict:
+    def step_simulation(ctx: Context, steps: int = 1) -> dict:
         """Advance the simulation cursor by N moves."""
-        sim = get_service().step_simulation(steps=steps)
-        svc = get_service()
+        svc = _svc(ctx)
+        sim = svc.step_simulation(steps=steps)
         total = len(svc.slice_result.moves) if svc.slice_result else 0
         return {
             "running": sim.running,
@@ -298,10 +341,10 @@ def build_mcp() -> FastMCP:
         }
 
     @mcp.tool
-    def set_simulation_cursor(cursor: int) -> dict:
+    def set_simulation_cursor(cursor: int, ctx: Context) -> dict:
         """Jump the simulation cursor to a specific move index."""
-        sim = get_service().set_simulation_cursor(cursor)
-        svc = get_service()
+        svc = _svc(ctx)
+        sim = svc.set_simulation_cursor(cursor)
         total = len(svc.slice_result.moves) if svc.slice_result else 0
         return {
             "running": sim.running,
@@ -310,16 +353,60 @@ def build_mcp() -> FastMCP:
         }
 
     @mcp.tool
-    def get_simulation_frame() -> dict:
+    def get_simulation_frame(ctx: Context) -> dict:
         """Return the current head position and extruded moves-so-far."""
-        return get_service().get_simulation_frame()
+        return _svc(ctx).get_simulation_frame()
 
     @mcp.tool
-    def focus_viewer() -> dict:
+    def focus_viewer(ctx: Context) -> dict:
         """Ask the browser UI to reframe its camera so the loaded parts fill
         ~90% of the viewport. The browser polls for this request, so the
         effect is visible in a running UI session within a couple of seconds.
         """
-        return {"focus_request": get_service().request_focus()}
+        return {"focus_request": _svc(ctx).request_focus()}
+
+    @mcp.tool
+    def open_viewer(ctx: Context, title: str = "3D Print Simulator") -> dict:
+        """Open the live 3D printer viewer in the Atlas canvas panel.
+
+        Returns an Atlas v2 tool-output envelope with `display.type = "iframe"`
+        so Atlas opens the viewer in its side canvas. The iframe URL carries
+        this MCP session's id as `?session=<id>`, so subsequent uploads,
+        slices, and simulation steps made through MCP tools appear live in
+        the embedded viewer — and anything the user does in the viewer
+        (drag-drop STL, camera tweaks) is visible to the LLM on its next
+        get_printer_state call.
+
+        Call this once at the start of a session. Subsequent calls are safe
+        (same URL) but redundant.
+        """
+        sid = _session_id(ctx)
+        base = _viewer_public_url().rstrip("/")
+        # `embed=1` tells the frontend to hide the standalone chrome and
+        # render in iframe-friendly mode; `session=<sid>` wires every REST
+        # call from that tab back to this MCP session's PrinterService.
+        url = f"{base}/?embed=1&session={sid}"
+        return {
+            "results": {
+                "content": (
+                    "Live printer viewer opened in the canvas. The user can "
+                    "watch slicing + simulation in real time as you drive it."
+                ),
+                "session_id": sid,
+                "url": url,
+            },
+            "artifacts": [],
+            "display": {
+                "open_canvas": True,
+                "type": "iframe",
+                "url": url,
+                "title": title,
+                # allow-same-origin lets the iframe's fetch() calls send the
+                # X-Session-Id header to /api/* on the same origin; allow-scripts
+                # is required for the React app to boot.
+                "sandbox": "allow-scripts allow-same-origin allow-downloads",
+                "mode": "replace",
+            },
+        }
 
     return mcp
