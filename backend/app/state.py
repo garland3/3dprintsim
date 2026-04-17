@@ -28,8 +28,29 @@ class Part:
     scale: float = 1.0  # user-applied scale factor (e.g. 25.4 for inch → mm)
     placement: Placement | None = None
 
+    def scaled_bounds(self) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+        """AABB of the mesh after `scale` is applied, without touching triangles.
+
+        This is the read-heavy path (state fetches, arrange, bed-fit checks),
+        so we skip the full triangle rescale whenever only the bounds matter.
+        """
+        s = self.scale
+        mn = self.mesh.min_xyz
+        mx = self.mesh.max_xyz
+        if s == 1.0:
+            return mn, mx
+        return (mn[0] * s, mn[1] * s, mn[2] * s), (mx[0] * s, mx[1] * s, mx[2] * s)
+
+    def scaled_size(self) -> tuple[float, float, float]:
+        mn, mx = self.scaled_bounds()
+        return (mx[0] - mn[0], mx[1] - mn[1], mx[2] - mn[2])
+
     def scaled_mesh(self) -> Mesh:
-        """Return the mesh with the user's scale factor applied."""
+        """Return the mesh with the user's scale factor applied.
+
+        Rescales every triangle — call only when the full geometry is needed
+        (slicing, client-side rendering). For bounds/size prefer `scaled_bounds()`.
+        """
         if self.scale == 1.0:
             return self.mesh
         return scale_mesh(self.mesh, self.scale)
@@ -47,10 +68,7 @@ class Part:
         return translate(base, dx, dy, dz)
 
     def to_public(self) -> dict:
-        base = self.scaled_mesh()
-        mn = base.min_xyz
-        mx = base.max_xyz
-        size = (mx[0] - mn[0], mx[1] - mn[1], mx[2] - mn[2])
+        size = self.scaled_size()
         return {
             "id": self.id,
             "name": self.name,
@@ -134,11 +152,7 @@ class PrinterService:
         """
         from .arrange import DEFAULT_MARGIN
 
-        base = part.scaled_mesh()
-        mn = base.min_xyz
-        mx = base.max_xyz
-        w = mx[0] - mn[0]
-        d = mx[1] - mn[1]
+        w, d, _ = part.scaled_size()
         bx, by, _ = self.bed_size
         if w + 2 * DEFAULT_MARGIN > bx or d + 2 * DEFAULT_MARGIN > by:
             raise ArrangeError(
@@ -203,9 +217,7 @@ class PrinterService:
     def _auto_arrange_locked(self) -> list[Placement]:
         inputs = []
         for part in self.parts.values():
-            base = part.scaled_mesh()
-            w = base.max_xyz[0] - base.min_xyz[0]
-            d = base.max_xyz[1] - base.min_xyz[1]
+            w, d, _ = part.scaled_size()
             inputs.append(ArrangeInput(part_id=part.id, width=w, depth=d))
         bx, by, _ = self.bed_size
         placements = arrange(inputs, bx, by)

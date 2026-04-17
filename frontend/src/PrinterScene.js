@@ -224,6 +224,10 @@ export class PrinterScene {
 
     if (!moves || moves.length === 0) {
       this.head.visible = false;
+      // Clearing / reloading after a sim ran needs to undo the "hide the source
+      // mesh during printing" flag that setCursor sets — otherwise newly
+      // uploaded parts render invisible until the user scrubs back to 0.
+      this.partsGroup.visible = true;
       this._ghostMat = null;
       this._printedMat = null;
       this._printedPositions = null;

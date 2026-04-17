@@ -29,33 +29,27 @@ export default function App() {
   const [error, setError] = useState('');
   const [dragging, setDragging] = useState(false);
   const [pending, setPending] = useState({});
+  // Synchronous mirror of `pending`. React's setPending is async/batched, so a
+  // guard that reads the state-updater closure can miss a rapid re-entrant
+  // click. The ref gives us an immediate lockout before we kick off `fn`.
+  const pendingRef = useRef({});
 
   // Wrap an async handler so the corresponding `pending[key]` flag is set for
   // the duration of the request. Callers gate their button on `isPending(key)`
   // to both disable re-entry and swap the label for a spinner.
   const isPending = useCallback((key) => !!pending[key], [pending]);
   const run = useCallback((key, fn) => async (...args) => {
-    let accepted = true;
-    setPending((p) => {
-      if (p[key]) {
-        accepted = false;
-        return p;
-      }
-      return { ...p, [key]: true };
-    });
-    if (!accepted) return;
+    if (pendingRef.current[key]) return;
+    pendingRef.current[key] = true;
+    setPending({ ...pendingRef.current });
     setError('');
     try {
       return await fn(...args);
     } catch (e) {
       setError(String(e));
     } finally {
-      setPending((p) => {
-        if (!p[key]) return p;
-        const n = { ...p };
-        delete n[key];
-        return n;
-      });
+      delete pendingRef.current[key];
+      setPending({ ...pendingRef.current });
     }
   }, []);
 

@@ -4,6 +4,9 @@
 # The final image runs both services on ports 8000 (API+MCP) and 5173 (UI).
 
 ARG UBI_VERSION=9.4
+# Pin uv so resolver/CLI changes in a future release can't silently break the
+# backend install step; bump deliberately when rolling the lockfile.
+ARG UV_VERSION=0.8.17
 
 # ─── Stage 1 — build the React/Vite frontend ──────────────────────────────────
 FROM registry.access.redhat.com/ubi9/nodejs-20:${UBI_VERSION} AS frontend-build
@@ -20,6 +23,10 @@ RUN npm run build
 # ─── Stage 2 — Python runtime + built frontend ────────────────────────────────
 FROM registry.access.redhat.com/ubi9/ubi:${UBI_VERSION} AS runtime
 
+# ARGs declared before the first FROM need re-declaration to be visible in
+# a stage (Docker scoping rule).
+ARG UV_VERSION
+
 # Python 3.11 + uv for dependency management, plus Node (used only to serve the
 # built frontend via vite preview). dnf clean keeps the layer small.
 RUN dnf install -y --setopt=install_weak_deps=False \
@@ -28,7 +35,7 @@ RUN dnf install -y --setopt=install_weak_deps=False \
         shadow-utils \
     && dnf clean all \
     && rm -rf /var/cache/dnf \
-    && python3.11 -m pip install --no-cache-dir uv
+    && python3.11 -m pip install --no-cache-dir "uv==${UV_VERSION}"
 
 # Create an unprivileged user to run the services.
 RUN useradd --system --create-home --uid 1001 printsim
