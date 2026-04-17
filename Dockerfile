@@ -20,23 +20,30 @@ RUN npm run build
 # ─── Stage 2 — Python runtime + built frontend ────────────────────────────────
 FROM registry.access.redhat.com/ubi9/ubi:${UBI_VERSION} AS runtime
 
-# Python 3.11 + pip, plus Node (used only to serve the built frontend via vite
-# preview). dnf clean keeps the layer small.
+# Python 3.11 + uv for dependency management, plus Node (used only to serve the
+# built frontend via vite preview). dnf clean keeps the layer small.
 RUN dnf install -y --setopt=install_weak_deps=False \
         python3.11 python3.11-pip \
         nodejs npm \
         shadow-utils \
     && dnf clean all \
-    && rm -rf /var/cache/dnf
+    && rm -rf /var/cache/dnf \
+    && python3.11 -m pip install --no-cache-dir uv
 
 # Create an unprivileged user to run the services.
 RUN useradd --system --create-home --uid 1001 printsim
 
 WORKDIR /app
 
-# Install backend deps against system Python 3.11.
-COPY backend/requirements.txt /app/backend/requirements.txt
-RUN python3.11 -m pip install --no-cache-dir -r /app/backend/requirements.txt
+# Install backend deps with uv into a project-local .venv. --frozen uses the
+# committed lockfile for reproducible builds; --no-install-project skips
+# installing the backend itself (it's a non-package app, run from source).
+ENV UV_PROJECT_ENVIRONMENT=/app/backend/.venv \
+    UV_LINK_MODE=copy \
+    UV_COMPILE_BYTECODE=1
+COPY backend/pyproject.toml backend/uv.lock /app/backend/
+WORKDIR /app/backend
+RUN uv sync --frozen --no-install-project
 
 COPY backend/ /app/backend/
 
@@ -58,7 +65,8 @@ USER printsim
 ENV PYTHONUNBUFFERED=1 \
     HOST=0.0.0.0 \
     BACKEND_PORT=8000 \
-    FRONTEND_PORT=5173
+    FRONTEND_PORT=5173 \
+    PATH=/app/backend/.venv/bin:$PATH
 
 EXPOSE 8000 5173
 

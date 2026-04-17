@@ -21,9 +21,10 @@ from `package-lock.json`, then runs `npm run build` to produce
 
 ### Stage 2 — runtime
 
-Base: `registry.access.redhat.com/ubi9/ubi`. Installs Python 3.11 and
-Node.js from the UBI repos, installs backend requirements, copies the
-backend source and the built frontend bundle, and runs as non-root user
+Base: `registry.access.redhat.com/ubi9/ubi`. Installs Python 3.11, `uv`
+(via pip), and Node.js from the UBI repos; then `uv sync --frozen` resolves
+the backend `.venv` from the committed `uv.lock`, the backend source and
+built frontend bundle are copied in, and the image runs as non-root user
 `printsim` (UID 1001).
 
 A healthcheck polls `/api/health` every 15 s.
@@ -76,8 +77,8 @@ docker run --rm -p 9000:9000 -p 4173:4173 \
 
 The build is layered so that dependency installs are cached across runs:
 
-1. Only `package.json` / `requirements.txt` changed → only the dep-install
-   layers rebuild.
+1. Only `package.json` / `pyproject.toml` / `uv.lock` changed → only the
+   dep-install layers rebuild.
 2. Only `frontend/src` changed → only the Vite build re-runs.
 3. Only `backend/app` changed → only the final COPY layer re-runs.
 

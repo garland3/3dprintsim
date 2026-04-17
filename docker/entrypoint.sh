@@ -10,7 +10,7 @@ HOST="${HOST:-0.0.0.0}"
 
 echo "[entrypoint] starting backend on ${HOST}:${BACKEND_PORT}"
 cd /app/backend
-python3.11 -m uvicorn app.main:app --host "${HOST}" --port "${BACKEND_PORT}" &
+uv run --frozen --no-sync uvicorn app.main:app --host "${HOST}" --port "${BACKEND_PORT}" &
 BACKEND_PID=$!
 
 echo "[entrypoint] starting frontend preview on ${HOST}:${FRONTEND_PORT}"

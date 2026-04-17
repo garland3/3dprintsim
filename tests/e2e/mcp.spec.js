@@ -10,11 +10,14 @@ import fs from 'fs';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const CUBE_PATH = path.resolve(here, '../fixtures/cube20.stl');
 const CUBE_B64 = fs.readFileSync(CUBE_PATH).toString('base64');
+const BACKEND_DIR = path.resolve(here, '../../backend');
 
 function runAgent(script, env = {}) {
-  const res = spawnSync('python3', ['-c', script], {
+  // Run through `uv` so the backend's .venv (with fastmcp) is used.
+  const res = spawnSync('uv', ['run', '--frozen', 'python', '-c', script], {
     encoding: 'utf-8',
     env: { ...process.env, ...env },
+    cwd: BACKEND_DIR,
     timeout: 30_000,
   });
   if (res.status !== 0) {
