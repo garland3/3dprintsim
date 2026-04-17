@@ -11,11 +11,15 @@ docs/      This folder — markdown + generated screenshots + capture script
 
 ## Running locally
 
+Dependencies are managed with [uv](https://docs.astral.sh/uv/). Install it
+once (`curl -LsSf https://astral.sh/uv/install.sh | sh`) and the rest is
+driven by `uv sync` / `uv run`.
+
 ```bash
 # Backend
 cd backend
-pip install -r requirements.txt
-uvicorn app.main:app --reload --port 8000
+uv sync                                     # creates .venv from uv.lock
+uv run uvicorn app.main:app --reload --port 8000
 
 # Frontend (separate terminal)
 cd frontend
@@ -32,7 +36,7 @@ With both running, open `http://localhost:5173`. The
 
 ```bash
 cd backend
-pytest
+uv run pytest
 ```
 
 Covered: STL parsing (ASCII + binary), arrange packing, slicer cross-section
@@ -67,7 +71,7 @@ UI through Playwright so the documentation is always "true".
 cd tests && npm install && npx playwright install chromium
 
 # 2. Start the services
-(cd backend && uvicorn app.main:app --port 8000) &
+(cd backend && uv run uvicorn app.main:app --port 8000) &
 (cd frontend && npm run dev) &
 
 # 3. Run the capture script — requires docs/ to see @playwright/test.

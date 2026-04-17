@@ -127,7 +127,9 @@ export class PrinterScene {
         this._orbit.target.x -= dx * panScale;
         this._orbit.target.z += dy * panScale;
       } else {
-        this._orbit.azimuth -= dx * 0.008;
+        // Drag follows the model: dragging right rotates the scene right
+        // (camera orbits the opposite way around the target).
+        this._orbit.azimuth += dx * 0.008;
         this._orbit.polar = Math.max(0.1, Math.min(Math.PI - 0.1, this._orbit.polar - dy * 0.008));
       }
       this._applyOrbit();
@@ -222,6 +224,10 @@ export class PrinterScene {
 
     if (!moves || moves.length === 0) {
       this.head.visible = false;
+      // Clearing / reloading after a sim ran needs to undo the "hide the source
+      // mesh during printing" flag that setCursor sets — otherwise newly
+      // uploaded parts render invisible until the user scrubs back to 0.
+      this.partsGroup.visible = true;
       this._ghostMat = null;
       this._printedMat = null;
       this._printedPositions = null;
@@ -332,6 +338,10 @@ export class PrinterScene {
       col[o] = r; col[o + 1] = g; col[o + 2] = b;
       col[o + 3] = r; col[o + 4] = g; col[o + 5] = b;
     }
+
+    // During simulation hide the translucent source mesh so the fresh filament
+    // is the only thing on screen; when reset to cursor 0 the mesh reappears.
+    this.partsGroup.visible = visibleSegs === 0;
 
     this._disposeGroup(this.printedGroup);
     this.printedGroup.clear();

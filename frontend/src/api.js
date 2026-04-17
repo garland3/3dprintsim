@@ -24,15 +24,22 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ x, y, z }),
     }).then(json),
-  upload: (file) => {
+  upload: (file, scale = 1) => {
     const fd = new FormData();
     fd.append('file', file);
+    if (scale && scale !== 1) fd.append('scale', String(scale));
     return fetch('/api/parts/upload', { method: 'POST', body: fd }).then(json);
   },
   listParts: () => fetch('/api/parts', GET).then(json),
   partGeometry: (id) => fetch(`/api/parts/${id}/geometry`, GET).then(json),
   removePart: (id) => fetch(`/api/parts/${id}`, { method: 'DELETE' }).then(json),
   clearParts: () => fetch('/api/parts/clear', { method: 'POST' }).then(json),
+  setPartScale: (id, scale) =>
+    fetch(`/api/parts/${id}/scale`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ scale }),
+    }).then(json),
   arrange: () => fetch('/api/arrange', { method: 'POST' }).then(json),
   slice: (params) =>
     fetch('/api/slice', {

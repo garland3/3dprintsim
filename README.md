@@ -30,10 +30,10 @@ Two ways to drive it:
 ## Quickstart
 
 ```bash
-# Backend
+# Backend (uses uv — https://docs.astral.sh/uv/)
 cd backend
-pip install -r requirements.txt
-uvicorn app.main:app --reload --port 8000
+uv sync
+uv run uvicorn app.main:app --reload --port 8000
 
 # Frontend (separate terminal)
 cd frontend
@@ -80,7 +80,7 @@ Served at `/mcp`. See `backend/app/mcp_server.py` for definitions.
 
 ```bash
 # Backend unit tests
-cd backend && pytest
+cd backend && uv run pytest
 
 # Playwright E2E (starts backend + frontend via config)
 cd tests && npm install && npx playwright test

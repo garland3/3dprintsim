@@ -12,17 +12,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
         with:
-          python-version: '3.11'
+          # Pin to match the Dockerfile's UV_VERSION so local, Docker, and CI
+          # builds resolve against the same uv release.
+          version: "0.8.17"
+          enable-cache: true
+          cache-dependency-glob: backend/uv.lock
+
+      - name: Set up Python
+        run: uv python install 3.11
+        working-directory: backend
+
+      - name: Install backend dependencies
+        run: uv sync --frozen
+        working-directory: backend
 
       - name: Backend tests
-        run: |
-          cd backend
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pytest tests/ -v
+        run: uv run --frozen pytest tests/ -v
+        working-directory: backend
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -47,4 +56,3 @@ jobs:
           npx playwright test
         env:
           CI: true
-

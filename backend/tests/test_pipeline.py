@@ -275,6 +275,73 @@ def test_upload_oversize_part_stays_unplaced_and_slice_returns_409(client: TestC
     assert "does not fit" in r.json().get("detail", "")
 
 
+def test_upload_with_scale_applies_factor(client: TestClient):
+    """`scale` on the upload form should multiply every dimension at import."""
+    data = make_binary_cube_stl(size=10.0)
+    r = client.post(
+        "/api/parts/upload",
+        files={"file": ("cube.stl", data, "model/stl")},
+        data={"scale": "25.4"},  # inch → mm
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["scale"] == 25.4
+    # 10mm × 25.4 = 254 mm per axis
+    for dim in body["size"]:
+        assert abs(dim - 254.0) < 1e-6
+
+
+def test_upload_rejects_non_positive_scale(client: TestClient):
+    data = make_binary_cube_stl(size=10.0)
+    r = client.post(
+        "/api/parts/upload",
+        files={"file": ("cube.stl", data, "model/stl")},
+        data={"scale": "0"},
+    )
+    assert r.status_code == 400
+
+
+def test_set_part_scale_updates_size_and_reflows(client: TestClient):
+    pid = upload_cube(client, size=10.0)
+    r = client.post(f"/api/parts/{pid}/scale", json={"scale": 2.0})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["scale"] == 2.0
+    assert body["size"] == [20.0, 20.0, 20.0]
+    # Single-part after scale must be re-centered on the default bed.
+    pl = body["placement"]
+    assert pl is not None
+    assert abs(pl["x"] - (250 - 20) / 2) < 0.5
+    assert abs(pl["y"] - (210 - 20) / 2) < 0.5
+
+
+def test_set_part_scale_invalidates_slice(client: TestClient):
+    pid = upload_cube(client, size=10.0)
+    client.post("/api/slice", json={"layer_height": 1.0})
+    assert client.get("/api/slice").json()["ready"]
+    client.post(f"/api/parts/{pid}/scale", json={"scale": 1.5})
+    assert client.get("/api/slice").json()["ready"] is False
+
+
+def test_set_part_scale_oversize_leaves_unplaced(client: TestClient):
+    """Scaling past the bed must drop the placement rather than overflow."""
+    client.post("/api/bed", json={"x": 50, "y": 50, "z": 200})
+    pid = upload_cube(client, size=10.0)
+    body = client.post(f"/api/parts/{pid}/scale", json={"scale": 10.0}).json()
+    assert body["placement"] is None
+
+
+def test_set_part_scale_404_for_unknown(client: TestClient):
+    r = client.post("/api/parts/doesnotexist/scale", json={"scale": 2.0})
+    assert r.status_code == 404
+
+
+def test_set_part_scale_rejects_non_positive(client: TestClient):
+    pid = upload_cube(client, size=10.0)
+    r = client.post(f"/api/parts/{pid}/scale", json={"scale": 0})
+    assert r.status_code in (400, 422)
+
+
 def test_remove_and_clear(client: TestClient):
     pid = upload_cube(client)
     client.delete(f"/api/parts/{pid}")
@@ -317,6 +384,7 @@ def test_mcp_tools_exposed():
         "step_simulation",
         "set_simulation_cursor",
         "get_simulation_frame",
+        "set_part_scale",
     }
     assert expected <= names
 
