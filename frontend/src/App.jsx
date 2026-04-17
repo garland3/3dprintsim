@@ -29,6 +29,7 @@ export default function App() {
   const [error, setError] = useState('');
   const [dragging, setDragging] = useState(false);
   const [pending, setPending] = useState({});
+  const [showToolpath, setShowToolpath] = useState(false);
   // Synchronous mirror of `pending`. React's setPending is async/batched, so a
   // guard that reads the state-updater closure can miss a rapid re-entrant
   // click. The ref gives us an immediate lockout before we kick off `fn`.
@@ -66,6 +67,52 @@ export default function App() {
       window.__printerScene = null;
     };
   }, []);
+
+  const focusView = useCallback(() => {
+    if (sceneRef.current) sceneRef.current.focus();
+  }, []);
+
+  // 'f' hotkey — ignore when the user is typing into a form field so it
+  // doesn't swallow a keystroke inside a number input.
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.key !== 'f' && e.key !== 'F') return;
+      const t = e.target;
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)) return;
+      e.preventDefault();
+      focusView();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [focusView]);
+
+  // Poll the backend for one-shot viewer requests (e.g. MCP-initiated focus).
+  // Two-second cadence is fine: this is a developer tool and the polls are
+  // tiny. Only the delta (counter increasing) triggers the local action.
+  useEffect(() => {
+    let cancelled = false;
+    let lastFocus = null;
+    const tick = async () => {
+      try {
+        const r = await api.viewerRequests();
+        if (cancelled) return;
+        if (lastFocus !== null && r.focus_request > lastFocus) {
+          focusView();
+        }
+        lastFocus = r.focus_request;
+      } catch {
+        // intentional swallow: backend hiccups shouldn't crash the UI
+      }
+    };
+    tick();
+    const id = setInterval(tick, 2000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, [focusView]);
+
+  // Keep the scene's toolpath visibility in sync with the sidebar toggle.
+  useEffect(() => {
+    if (sceneRef.current) sceneRef.current.setToolpathVisible(showToolpath);
+  }, [showToolpath]);
 
   const refreshState = useCallback(async () => {
     try {
@@ -446,10 +493,29 @@ export default function App() {
             <span className="value" data-testid="sim-cursor">{sim.cursor} / {sim.total}</span>
           </div>
         )}
+        <label className="checkbox-row">
+          <input
+            type="checkbox"
+            checked={showToolpath}
+            onChange={(e) => setShowToolpath(e.target.checked)}
+            data-testid="toggle-toolpath"
+          />
+          Show toolpath lines
+        </label>
       </aside>
 
       <main className="viewer">
         <canvas ref={canvasRef} data-testid="viewer-canvas" />
+        <div className="viewer-toolbar">
+          <button
+            className="secondary"
+            onClick={focusView}
+            title="Focus on parts (f)"
+            data-testid="focus-view"
+          >
+            Focus (f)
+          </button>
+        </div>
         <div className="overlay" data-testid="overlay">
           bed {bed.x}×{bed.y}×{bed.z} · parts {parts.length}
           {sliceSummary ? ` · ${sliceSummary.layer_count} layers` : ''}

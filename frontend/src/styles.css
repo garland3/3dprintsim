@@ -179,3 +179,25 @@ button { min-height: 32px; display: inline-flex; align-items: center; justify-co
 }
 .dropzone:hover { border-color: #2a82e4; color: #2a82e4; }
 .dropzone.dragging { border-color: #2a82e4; background: rgba(42, 130, 228, 0.1); }
+
+.checkbox-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+  font-size: 12px;
+  color: #8b9299;
+  cursor: pointer;
+}
+.checkbox-row input[type="checkbox"] { accent-color: #2a82e4; }
+
+/* Left-anchored floating toolbar for viewport-scoped actions (focus, …). */
+.viewer-toolbar {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.viewer-toolbar button { box-shadow: 0 2px 6px rgba(0,0,0,0.4); }

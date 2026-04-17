@@ -37,11 +37,15 @@ export class PrinterScene {
     this.printedGroup = new THREE.Group();
     this.scene.add(this.bedGroup, this.partsGroup, this.toolpathGroup, this.printedGroup);
 
+    // Hide the blue ghost toolpath by default — users asked to keep it off
+    // unless they opt in.
+    this.toolpathGroup.visible = false;
+
     this.head = this.makeHead();
     this.scene.add(this.head);
     this.head.visible = false;
 
-    // simple orbit: drag=rotate, wheel=zoom, shift+drag=pan.
+    // simple orbit: LMB=rotate, wheel=zoom, shift+LMB or RMB=pan.
     // Must be initialized before setBed(), which reads _orbit.target.
     this._orbit = { azimuth: Math.PI / 4, polar: Math.PI / 3, radius: 500, target: new THREE.Vector3() };
 
@@ -106,31 +110,47 @@ export class PrinterScene {
   _attachInput() {
     const c = this.canvas;
     let dragging = false;
-    let shiftPan = false;
+    let panning = false;
     let lastX = 0;
     let lastY = 0;
     c.addEventListener('mousedown', (e) => {
-      dragging = true;
-      shiftPan = e.shiftKey;
+      // Right mouse button OR shift+left = pan; plain left = rotate.
+      if (e.button === 2 || (e.button === 0 && e.shiftKey)) {
+        panning = true;
+        dragging = false;
+      } else if (e.button === 0) {
+        dragging = true;
+        panning = false;
+      } else {
+        return;
+      }
       lastX = e.clientX;
       lastY = e.clientY;
+      e.preventDefault();
     });
-    window.addEventListener('mouseup', () => { dragging = false; });
+    // Suppress the browser context menu so RMB pan feels natural.
+    c.addEventListener('contextmenu', (e) => e.preventDefault());
+    window.addEventListener('mouseup', () => { dragging = false; panning = false; });
     window.addEventListener('mousemove', (e) => {
-      if (!dragging) return;
+      if (!dragging && !panning) return;
       const dx = e.clientX - lastX;
       const dy = e.clientY - lastY;
       lastX = e.clientX;
       lastY = e.clientY;
-      if (shiftPan) {
-        const panScale = this._orbit.radius * 0.002;
-        this._orbit.target.x -= dx * panScale;
-        this._orbit.target.z += dy * panScale;
+      if (panning) {
+        // Pan in the camera's own X/Y plane so dragging feels 1:1 regardless
+        // of the current orbit angle.
+        const panScale = this._orbit.radius * 0.0015;
+        const right = new THREE.Vector3();
+        const up = new THREE.Vector3();
+        this.camera.matrixWorld.extractBasis(right, up, new THREE.Vector3());
+        this._orbit.target.addScaledVector(right, -dx * panScale);
+        this._orbit.target.addScaledVector(up, dy * panScale);
       } else {
-        // Drag follows the model: dragging right rotates the scene right
-        // (camera orbits the opposite way around the target).
-        this._orbit.azimuth += dx * 0.008;
-        this._orbit.polar = Math.max(0.1, Math.min(Math.PI - 0.1, this._orbit.polar - dy * 0.008));
+        // CAD-style: dragging the cursor RIGHT rotates the view RIGHT (camera
+        // orbits in the same direction the user drags).
+        this._orbit.azimuth -= dx * 0.008;
+        this._orbit.polar = Math.max(0.1, Math.min(Math.PI - 0.1, this._orbit.polar + dy * 0.008));
       }
       this._applyOrbit();
     });
@@ -143,9 +163,11 @@ export class PrinterScene {
   }
 
   makeHead() {
+    // Cone with its apex (nozzle tip) at local origin pointing down, body
+    // extending +Y so the mesh's world position is the nozzle tip itself.
     const geo = new THREE.ConeGeometry(4, 10, 16);
-    geo.rotateX(Math.PI); // point down
-    geo.translate(0, -5, 0);
+    geo.rotateX(Math.PI);
+    geo.translate(0, 5, 0);
     const mat = new THREE.MeshStandardMaterial({ color: 0xff5522, emissive: 0x441100 });
     const mesh = new THREE.Mesh(geo, mat);
     mesh.name = 'head';
@@ -361,9 +383,57 @@ export class PrinterScene {
 
     const head = moves[Math.min(cursor, moves.length - 1)];
     if (head) {
-      this.head.position.set(head.x, head.z + 3, head.y);
+      // Apex sits 0.5mm above the current layer z so the nozzle is visibly
+      // poised just over the last deposited segment instead of buried in it.
+      this.head.position.set(head.x, head.z + 0.5, head.y);
     }
     this._lastCursor = cursor;
+  }
+
+  setToolpathVisible(visible) {
+    this.toolpathGroup.visible = !!visible;
+  }
+
+  // Frame the camera on the loaded parts (or bed, if none) so they fill ~90%
+  // of the viewport. Keeps the current azimuth/polar, only adjusts target and
+  // radius so the user's orientation isn't disturbed.
+  focus() {
+    const bbox = new THREE.Box3();
+    if (this.partsGroup.children.length > 0) {
+      bbox.makeEmpty();
+      for (const child of this.partsGroup.children) {
+        const childBox = new THREE.Box3().setFromObject(child);
+        bbox.union(childBox);
+      }
+    }
+    if (bbox.isEmpty()) {
+      // Fall back to the bed volume so the button is never a no-op.
+      const [bx, by, bz] = this.bedSize;
+      bbox.set(
+        new THREE.Vector3(0, 0, 0),
+        new THREE.Vector3(bx, bz, by),
+      );
+    }
+
+    const center = bbox.getCenter(new THREE.Vector3());
+    const size = bbox.getSize(new THREE.Vector3());
+
+    // Pick a radius that places the largest dimension at ~90% of the smaller
+    // viewport axis. Using the vertical half-fov as the limiting factor keeps
+    // the fit correct even when the viewer is tall.
+    const aspect = this.camera.aspect || 1;
+    const vFov = (this.camera.fov * Math.PI) / 180;
+    const hFov = 2 * Math.atan(Math.tan(vFov / 2) * aspect);
+    const halfV = Math.max(size.x, size.y, size.z) / 2;
+    const halfH = halfV;
+    const distV = halfV / Math.tan(vFov / 2);
+    const distH = halfH / Math.tan(hFov / 2);
+    const fillRatio = 0.9;
+    const radius = Math.max(distV, distH) / fillRatio;
+
+    this._orbit.target.copy(center);
+    this._orbit.radius = Math.max(50, Math.min(3000, radius));
+    this._applyOrbit();
   }
 
   // Accessor for tests to verify what got rendered.

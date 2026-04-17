@@ -147,4 +147,12 @@ def build_mcp() -> FastMCP:
         """Return the current head position and extruded moves-so-far."""
         return get_service().get_simulation_frame()
 
+    @mcp.tool
+    def focus_viewer() -> dict:
+        """Ask the browser UI to reframe its camera so the loaded parts fill
+        ~90% of the viewport. The browser polls for this request, so the
+        effect is visible in a running UI session within a couple of seconds.
+        """
+        return {"focus_request": get_service().request_focus()}
+
     return mcp

@@ -216,6 +216,15 @@ def create_app() -> FastAPI:
     def sim_frame() -> dict:
         return get_service().get_simulation_frame()
 
+    @app.get("/api/viewer/requests")
+    def viewer_requests() -> dict:
+        """Tiny polling endpoint: returns one-shot UI request counters."""
+        return get_service().get_viewer_requests()
+
+    @app.post("/api/viewer/focus")
+    def request_focus() -> dict:
+        return {"focus_request": get_service().request_focus()}
+
     return app
 
 
