@@ -66,9 +66,28 @@ def build_mcp() -> FastMCP:
         ]
 
     @mcp.tool
-    def slice_all(layer_height_mm: float = 0.4, perimeters: int = 1) -> dict:
-        """Slice every loaded part at the given layer height and return a summary."""
-        result = get_service().slice_all(layer_height=layer_height_mm, perimeters=perimeters)
+    def slice_all(
+        layer_height_mm: float = 0.4,
+        perimeters: int = 1,
+        infill_density: float = 0.2,
+        top_layers: int = 3,
+        bottom_layers: int = 3,
+        nozzle_width_mm: float = 0.4,
+    ) -> dict:
+        """Slice every loaded part and return a summary.
+
+        infill_density is 0..1 (fraction of the layer filled with sparse infill).
+        The first bottom_layers and last top_layers of each part are filled with
+        solid (100%) infill to form proper top/bottom surfaces.
+        """
+        result = get_service().slice_all(
+            layer_height=layer_height_mm,
+            perimeters=perimeters,
+            infill_density=infill_density,
+            top_layers=top_layers,
+            bottom_layers=bottom_layers,
+            nozzle_width=nozzle_width_mm,
+        )
         return result.summary()
 
     @mcp.tool

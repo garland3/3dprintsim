@@ -152,6 +152,67 @@ def test_simulation_requires_slice(client: TestClient):
     assert r.status_code == 400
 
 
+def test_upload_auto_centers_single_part(client: TestClient):
+    """A freshly uploaded single part should be centered on the bed, not at (0,0)."""
+    upload_cube(client, size=20.0)
+    parts = client.get("/api/parts").json()
+    assert len(parts) == 1
+    pl = parts[0]["placement"]
+    assert pl is not None, "upload should initialize a placement so the part is visible"
+    # 250x210 bed, 20mm cube: centered min-corner is (115, 95).
+    assert abs(pl["x"] - 115.0) < 0.5
+    assert abs(pl["y"] - 95.0) < 0.5
+
+
+def test_auto_arrange_centers_block(client: TestClient):
+    """Auto-arrange should place the packed-block around the bed center."""
+    for _ in range(2):
+        upload_cube(client, size=20.0)
+    placements = client.post("/api/arrange").json()["placements"]
+    assert len(placements) == 2
+    # Block spans ~45mm (20 + 5 gap + 20). On 250x210 bed centered that means
+    # min.x ≈ (250 - 45)/2 = 102.5 and max.x ≈ 147.5.
+    xs = sorted(p["x"] for p in placements)
+    assert abs(xs[0] - 102.5) < 1.0
+    assert abs((xs[1] + 20) - 147.5) < 1.0
+
+
+def test_slice_with_infill_adds_moves(client: TestClient):
+    """Adding infill must produce materially more extrude moves than perimeter-only."""
+    upload_cube(client, size=20.0)
+    bare = client.post(
+        "/api/slice",
+        json={"layer_height": 1.0, "perimeters": 1, "infill_density": 0.0, "top_layers": 0, "bottom_layers": 0},
+    ).json()
+    with_infill = client.post(
+        "/api/slice",
+        json={"layer_height": 1.0, "perimeters": 1, "infill_density": 0.2, "top_layers": 3, "bottom_layers": 3},
+    ).json()
+    assert with_infill["move_count"] > bare["move_count"] * 2
+    assert with_infill["infill_density"] == 0.2
+    assert with_infill["top_layers"] == 3
+    assert with_infill["bottom_layers"] == 3
+
+
+def test_slice_solid_top_bottom_more_than_sparse_middle(client: TestClient):
+    """Top/bottom solid layers should each have more infill moves than a sparse layer."""
+    upload_cube(client, size=10.0)
+    client.post(
+        "/api/slice",
+        json={"layer_height": 1.0, "perimeters": 1, "infill_density": 0.1, "top_layers": 2, "bottom_layers": 2},
+    )
+    payload = client.get("/api/slice").json()
+    moves = payload["moves"]
+    by_z: dict[float, int] = {}
+    for m in moves:
+        if m["kind"] == "extrude":
+            by_z[round(m["z"], 3)] = by_z.get(round(m["z"], 3), 0) + 1
+    zs = sorted(by_z)
+    solid_counts = [by_z[z] for z in zs[:2]] + [by_z[z] for z in zs[-2:]]
+    middle_counts = [by_z[z] for z in zs[2:-2]]
+    assert min(solid_counts) > max(middle_counts)
+
+
 def test_remove_and_clear(client: TestClient):
     pid = upload_cube(client)
     client.delete(f"/api/parts/{pid}")
