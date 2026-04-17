@@ -67,4 +67,7 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ cursor }),
     }).then(json),
+  viewerRequests: () => fetch('/api/viewer/requests', GET).then(json),
+  requestFocus: () =>
+    fetch('/api/viewer/focus', { method: 'POST' }).then(json),
 };

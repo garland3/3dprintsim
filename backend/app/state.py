@@ -105,6 +105,10 @@ class PrinterService:
         self.parts: dict[str, Part] = {}
         self.slice_result: SliceResult | None = None
         self.simulation = Simulation()
+        # Monotonic counter the browser polls to trigger a one-shot viewer
+        # action (currently: camera focus). The counter is preserved across
+        # slice invalidation on purpose — it's a UI signal, not print state.
+        self.focus_request: int = 0
 
     # --- printer config ---
 
@@ -333,6 +337,15 @@ class PrinterService:
                 ],
                 "moves": [asdict(m) for m in self.slice_result.moves],
             }
+
+    def request_focus(self) -> int:
+        with self._lock:
+            self.focus_request += 1
+            return self.focus_request
+
+    def get_viewer_requests(self) -> dict:
+        with self._lock:
+            return {"focus_request": self.focus_request}
 
     def get_part_geometry(self, part_id: str) -> dict:
         with self._lock:
