@@ -224,7 +224,6 @@ export class PrinterScene {
       this.head.visible = false;
       this._ghostMat = null;
       this._printedMat = null;
-      this._printedGeom = null;
       this._printedPositions = null;
       this._printedColors = null;
       this._extrudeSegments = null;
@@ -274,14 +273,14 @@ export class PrinterScene {
     ghostLines.computeLineDistances();
     this.toolpathGroup.add(ghostLines);
 
-    // --- printed: the deposited filament, with a hot glow ramp on the most
-    // recent segments. We pre-allocate the max buffers and setCursor rewrites
-    // the visible prefix.
+    // --- printed: the deposited filament. We pre-allocate the scratch arrays
+    // but DON'T create a LineSegments2 yet — setCursor rebuilds it from scratch
+    // each call because calling setPositions() on an existing
+    // LineSegmentsGeometry leaves Three.js's instanced-buffer state out of
+    // sync in r0.162 (the underlying buffer is swapped but the renderer keeps
+    // drawing the first frame's attribute). Rebuilding is cheap at our sizes.
     this._printedPositions = new Float32Array(segs.length * 6);
     this._printedColors = new Float32Array(segs.length * 6);
-    this._printedGeom = new LineSegmentsGeometry();
-    this._printedGeom.setPositions(this._printedPositions);
-    this._printedGeom.setColors(this._printedColors);
     this._printedMat = new LineMaterial({
       linewidth: 3.5,
       vertexColors: true,
@@ -289,8 +288,6 @@ export class PrinterScene {
       depthTest: true,
     });
     this._printedMat.resolution.set(resW, resH);
-    const printedLines = new LineSegments2(this._printedGeom, this._printedMat);
-    this.printedGroup.add(printedLines);
     this._printedVertCount = 0;
 
     this.head.visible = true;
@@ -314,7 +311,9 @@ export class PrinterScene {
     }
 
     // Fill positions + color ramp; the last GLOW_SEGMENTS get a hot-deposit
-    // color that fades into the settled filament tone.
+    // color that fades into the settled filament tone. We write into our
+    // reusable scratch arrays, then build a fresh LineSegmentsGeometry whose
+    // size matches the visible prefix.
     const pos = this._printedPositions;
     const col = this._printedColors;
     const deposited = [0.95, 0.42, 0.18]; // settled filament: orange
@@ -334,12 +333,19 @@ export class PrinterScene {
       col[o + 3] = r; col[o + 4] = g; col[o + 5] = b;
     }
 
-    if (this._printedGeom) {
-      // LineSegmentsGeometry wants packed InstancedInterleavedBuffers, so we
-      // pass slices sized to the visible prefix. Works fine at our sizes and
-      // sidesteps manual attribute plumbing.
-      this._printedGeom.setPositions(pos.subarray(0, visibleSegs * 6));
-      this._printedGeom.setColors(col.subarray(0, visibleSegs * 6));
+    this._disposeGroup(this.printedGroup);
+    this.printedGroup.clear();
+    if (visibleSegs > 0 && this._printedMat) {
+      // Fresh allocations so Three.js builds a clean InstancedInterleavedBuffer
+      // for this frame; attempting to swap buffers on an existing
+      // LineSegmentsGeometry produced stale renders in r0.162.
+      const posView = new Float32Array(pos.buffer, pos.byteOffset, visibleSegs * 6);
+      const colView = new Float32Array(col.buffer, col.byteOffset, visibleSegs * 6);
+      const geom = new LineSegmentsGeometry();
+      geom.setPositions(posView);
+      geom.setColors(colView);
+      const lines = new LineSegments2(geom, this._printedMat);
+      this.printedGroup.add(lines);
     }
     this._printedVertCount = visibleSegs * 2;
 
