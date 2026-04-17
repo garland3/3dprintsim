@@ -96,8 +96,30 @@ class PrinterService:
         part = Part(id=part_id, name=name, mesh=mesh)
         with self._lock:
             self.parts[part_id] = part
+            # Place the new part on the bed immediately. If it's the only part,
+            # centering beats a corner drop; if there are others, re-pack all of
+            # them with auto-arrange so nothing overlaps.
+            if len(self.parts) == 1:
+                part.placement = self._center_placement(part)
+            else:
+                try:
+                    self._auto_arrange_locked()
+                except ArrangeError:
+                    # Bed too small to fit everything — fall back to centering
+                    # just the new part; user can fix bed size and re-arrange.
+                    part.placement = self._center_placement(part)
             self._invalidate_slice()
         return part
+
+    def _center_placement(self, part: Part) -> Placement:
+        mn = part.mesh.min_xyz
+        mx = part.mesh.max_xyz
+        w = mx[0] - mn[0]
+        d = mx[1] - mn[1]
+        bx, by, _ = self.bed_size
+        x = max(0.0, (bx - w) / 2)
+        y = max(0.0, (by - d) / 2)
+        return Placement(part_id=part.id, x=x, y=y, rotation_deg=0.0)
 
     def add_part_from_base64(self, name: str, b64: str) -> Part:
         try:
@@ -122,21 +144,33 @@ class PrinterService:
 
     def auto_arrange(self) -> list[Placement]:
         with self._lock:
-            inputs = []
-            for part in self.parts.values():
-                w = part.mesh.max_xyz[0] - part.mesh.min_xyz[0]
-                d = part.mesh.max_xyz[1] - part.mesh.min_xyz[1]
-                inputs.append(ArrangeInput(part_id=part.id, width=w, depth=d))
-            bx, by, _ = self.bed_size
-            placements = arrange(inputs, bx, by)
-            for p in placements:
-                self.parts[p.part_id].placement = p
+            placements = self._auto_arrange_locked()
             self._invalidate_slice()
             return placements
 
+    def _auto_arrange_locked(self) -> list[Placement]:
+        inputs = []
+        for part in self.parts.values():
+            w = part.mesh.max_xyz[0] - part.mesh.min_xyz[0]
+            d = part.mesh.max_xyz[1] - part.mesh.min_xyz[1]
+            inputs.append(ArrangeInput(part_id=part.id, width=w, depth=d))
+        bx, by, _ = self.bed_size
+        placements = arrange(inputs, bx, by)
+        for p in placements:
+            self.parts[p.part_id].placement = p
+        return placements
+
     # --- slicing ---
 
-    def slice_all(self, layer_height: float = 0.4, perimeters: int = 1) -> SliceResult:
+    def slice_all(
+        self,
+        layer_height: float = 0.4,
+        perimeters: int = 1,
+        infill_density: float = 0.2,
+        top_layers: int = 3,
+        bottom_layers: int = 3,
+        nozzle_width: float = 0.4,
+    ) -> SliceResult:
         with self._lock:
             if not self.parts:
                 raise ValueError("no parts loaded")
@@ -145,7 +179,15 @@ class PrinterService:
                 # Auto-arrange first so slicing always works against real bed positions.
                 self.auto_arrange()
             meshes = [p.placed_mesh() for p in self.parts.values()]
-            result = slice_meshes(meshes, layer_height=layer_height, perimeters=perimeters)
+            result = slice_meshes(
+                meshes,
+                layer_height=layer_height,
+                perimeters=perimeters,
+                infill_density=infill_density,
+                top_layers=top_layers,
+                bottom_layers=bottom_layers,
+                nozzle_width=nozzle_width,
+            )
             self.slice_result = result
             self.simulation = Simulation(running=False, cursor=0, speed=self.simulation.speed)
             return result
