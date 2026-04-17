@@ -1,13 +1,31 @@
 # 3D Print Sim
 
+![A virtual FDM print mid-simulation — thick glowing orange filament fills the lower layers, sparse rectilinear infill is visible through the top, and the print head hovers over the next layer](docs/screenshots/10-hero-infill-closeup.png)
+
 Virtual FDM printer simulator. Upload STLs, auto-arrange on the bed, slice into
-perimeter toolpaths, and watch the simulated print head build each layer.
+perimeters + infill + solid top/bottom layers, and watch the simulated print
+head build each layer as thick, glowing filament.
 
 Two ways to drive it:
 
 - **Humans**: React + Three.js UI at `http://localhost:5173`.
 - **AI agents**: Model Context Protocol server exposed over the same FastAPI
   backend at `http://localhost:8000/mcp` via `fastmcp`.
+
+## Features
+
+- **Real infill.** Rectilinear scan-line infill clipped to each layer's
+  contours, configurable density, alternating direction + zig-zag routing.
+- **Solid top/bottom layers.** First `bottom_layers` and last `top_layers` of
+  each part print at 100% infill so surfaces look closed. Per-part — a short
+  model next to a tall one still gets its own solid top.
+- **Thick glowing toolpath render.** Printed filament is drawn as thick
+  screen-space lines with a hot-yellow → settled-orange color ramp over the
+  most recently deposited segments.
+- **Auto-centered bed placement.** Uploaded parts land on the middle of the
+  plate; `auto_arrange` centers the packed block instead of hugging the corner.
+  Oversize parts stay unplaced and surface a 409 from `/api/slice` rather than
+  silently producing out-of-bounds toolpaths.
 
 ## Quickstart
 

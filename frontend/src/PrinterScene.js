@@ -3,6 +3,13 @@
 // The React layer only hands it data — this class is the sole Three.js user.
 
 import * as THREE from 'three';
+import { LineSegments2 } from 'three/addons/lines/LineSegments2.js';
+import { LineSegmentsGeometry } from 'three/addons/lines/LineSegmentsGeometry.js';
+import { LineMaterial } from 'three/addons/lines/LineMaterial.js';
+
+// Number of most-recent extrude segments that get the "hot / freshly extruded"
+// color ramp. Picked by eye — big enough to read, small enough to stay local.
+const GLOW_SEGMENTS = 40;
 
 export class PrinterScene {
   constructor(canvas) {
@@ -54,7 +61,20 @@ export class PrinterScene {
   dispose() {
     cancelAnimationFrame(this._raf);
     window.removeEventListener('resize', this._resize);
+    this._disposeGroup(this.toolpathGroup);
+    this._disposeGroup(this.printedGroup);
     this.renderer.dispose();
+  }
+
+  _disposeGroup(group) {
+    for (const obj of group.children) {
+      if (obj.geometry && typeof obj.geometry.dispose === 'function') {
+        obj.geometry.dispose();
+      }
+      if (obj.material && typeof obj.material.dispose === 'function') {
+        obj.material.dispose();
+      }
+    }
   }
 
   _resize = () => {
@@ -64,6 +84,9 @@ export class PrinterScene {
     this.renderer.setSize(w, h, false);
     this.camera.aspect = w / h;
     this.camera.updateProjectionMatrix();
+    // LineMaterial needs the viewport resolution to compute pixel line widths.
+    if (this._ghostMat) this._ghostMat.resolution.set(w, h);
+    if (this._printedMat) this._printedMat.resolution.set(w, h);
   };
 
   _animate = () => {
@@ -187,6 +210,11 @@ export class PrinterScene {
 
   // moves: full list from the slice endpoint (kind, x, y, z, e)
   setToolpath(moves) {
+    // Dispose GPU resources from the previous slice before clearing the
+    // Three.js groups; LineSegmentsGeometry/LineMaterial don't release their
+    // InstancedInterleavedBuffer / shader program otherwise.
+    this._disposeGroup(this.toolpathGroup);
+    this._disposeGroup(this.printedGroup);
     this.toolpathGroup.clear();
     this.printedGroup.clear();
     this._moves = moves || [];
@@ -194,32 +222,72 @@ export class PrinterScene {
 
     if (!moves || moves.length === 0) {
       this.head.visible = false;
+      this._ghostMat = null;
+      this._printedMat = null;
+      this._printedPositions = null;
+      this._printedColors = null;
+      this._extrudeSegments = null;
+      this._printedVertCount = 0;
       return;
     }
 
-    // Ghost of the full toolpath, drawn dim.
-    const positions = [];
+    // Pre-compute every extrude segment once. The move index is retained so
+    // setCursor can map a simulation cursor back to a segment count.
+    const segs = [];
     for (let i = 0; i < moves.length - 1; i++) {
       const a = moves[i];
       const b = moves[i + 1];
       if (b.kind !== 'extrude') continue;
-      positions.push(a.x, a.z, a.y, b.x, b.z, b.y);
+      // Three.js Y is up; backend (x,y,z) uses z as up, so swap here.
+      segs.push({
+        moveIndex: i + 1,
+        ax: a.x, ay: a.z, az: a.y,
+        bx: b.x, by: b.z, bz: b.y,
+      });
     }
-    const geo = new THREE.BufferGeometry();
-    geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
-    const mat = new THREE.LineBasicMaterial({ color: 0x2a82e4, transparent: true, opacity: 0.25 });
-    const lines = new THREE.LineSegments(geo, mat);
-    this.toolpathGroup.add(lines);
+    this._extrudeSegments = segs;
 
-    // Pre-build a "printed so far" line segments buffer updated in setCursor.
-    this._printedGeom = new THREE.BufferGeometry();
-    const maxVerts = positions.length;
-    this._printedPositions = new Float32Array(maxVerts);
-    this._printedGeom.setAttribute('position', new THREE.Float32BufferAttribute(this._printedPositions, 3));
-    this._printedGeom.setDrawRange(0, 0);
-    const printedMat = new THREE.LineBasicMaterial({ color: 0xff9955 });
-    const printedLines = new THREE.LineSegments(this._printedGeom, printedMat);
-    this.printedGroup.add(printedLines);
+    const rect = this.canvas.getBoundingClientRect();
+    const resW = Math.max(1, Math.floor(rect.width));
+    const resH = Math.max(1, Math.floor(rect.height));
+
+    // --- ghost: the full toolpath drawn as a dim, thick-ish line ---
+    const ghostPositions = new Float32Array(segs.length * 6);
+    for (let i = 0; i < segs.length; i++) {
+      const s = segs[i];
+      const o = i * 6;
+      ghostPositions[o] = s.ax; ghostPositions[o + 1] = s.ay; ghostPositions[o + 2] = s.az;
+      ghostPositions[o + 3] = s.bx; ghostPositions[o + 4] = s.by; ghostPositions[o + 5] = s.bz;
+    }
+    const ghostGeom = new LineSegmentsGeometry();
+    ghostGeom.setPositions(ghostPositions);
+    this._ghostMat = new LineMaterial({
+      color: 0x2a82e4,
+      linewidth: 1.2,
+      transparent: true,
+      opacity: 0.22,
+      depthTest: true,
+    });
+    this._ghostMat.resolution.set(resW, resH);
+    const ghostLines = new LineSegments2(ghostGeom, this._ghostMat);
+    ghostLines.computeLineDistances();
+    this.toolpathGroup.add(ghostLines);
+
+    // --- printed: the deposited filament. We pre-allocate the scratch arrays
+    // but DON'T create a LineSegments2 yet — setCursor rebuilds it from scratch
+    // each call because calling setPositions() on an existing
+    // LineSegmentsGeometry leaves Three.js's instanced-buffer state out of
+    // sync in r0.162 (the underlying buffer is swapped but the renderer keeps
+    // drawing the first frame's attribute). Rebuilding is cheap at our sizes.
+    this._printedPositions = new Float32Array(segs.length * 6);
+    this._printedColors = new Float32Array(segs.length * 6);
+    this._printedMat = new LineMaterial({
+      linewidth: 3.5,
+      vertexColors: true,
+      transparent: false,
+      depthTest: true,
+    });
+    this._printedMat.resolution.set(resW, resH);
     this._printedVertCount = 0;
 
     this.head.visible = true;
@@ -230,20 +298,56 @@ export class PrinterScene {
     if (!this._moves || this._moves.length === 0) return;
     const moves = this._moves;
     cursor = Math.max(0, Math.min(moves.length, cursor));
+    const segs = this._extrudeSegments || [];
 
-    // Rebuild printed segments from 0..cursor (simpler and correct after scrubbing).
-    const pos = this._printedPositions;
-    let n = 0;
-    for (let i = 0; i < cursor - 1 && i < moves.length - 1; i++) {
-      const a = moves[i];
-      const b = moves[i + 1];
-      if (b.kind !== 'extrude') continue;
-      pos[n++] = a.x; pos[n++] = a.z; pos[n++] = a.y;
-      pos[n++] = b.x; pos[n++] = b.z; pos[n++] = b.y;
+    // How many extrude segments have completed by this cursor. `moveIndex` is
+    // the index of the move that *terminates* the segment; the backend's
+    // cursor is the next move to execute, so a segment is complete only once
+    // cursor has advanced strictly past it (matches the original i<cursor-1).
+    let visibleSegs = 0;
+    for (let i = 0; i < segs.length; i++) {
+      if (segs[i].moveIndex < cursor) visibleSegs = i + 1;
+      else break;
     }
-    this._printedGeom.attributes.position.needsUpdate = true;
-    this._printedGeom.setDrawRange(0, n / 3);
-    this._printedVertCount = n / 3;
+
+    // Fill positions + color ramp; the last GLOW_SEGMENTS get a hot-deposit
+    // color that fades into the settled filament tone. We write into our
+    // reusable scratch arrays, then build a fresh LineSegmentsGeometry whose
+    // size matches the visible prefix.
+    const pos = this._printedPositions;
+    const col = this._printedColors;
+    const deposited = [0.95, 0.42, 0.18]; // settled filament: orange
+    const hot = [1.0, 0.95, 0.55];        // just-deposited: near-white yellow
+    for (let i = 0; i < visibleSegs; i++) {
+      const s = segs[i];
+      const o = i * 6;
+      pos[o] = s.ax; pos[o + 1] = s.ay; pos[o + 2] = s.az;
+      pos[o + 3] = s.bx; pos[o + 4] = s.by; pos[o + 5] = s.bz;
+
+      const fromEnd = visibleSegs - 1 - i;
+      const t = fromEnd < GLOW_SEGMENTS ? 1 - fromEnd / GLOW_SEGMENTS : 0;
+      const r = deposited[0] + (hot[0] - deposited[0]) * t;
+      const g = deposited[1] + (hot[1] - deposited[1]) * t;
+      const b = deposited[2] + (hot[2] - deposited[2]) * t;
+      col[o] = r; col[o + 1] = g; col[o + 2] = b;
+      col[o + 3] = r; col[o + 4] = g; col[o + 5] = b;
+    }
+
+    this._disposeGroup(this.printedGroup);
+    this.printedGroup.clear();
+    if (visibleSegs > 0 && this._printedMat) {
+      // Fresh allocations so Three.js builds a clean InstancedInterleavedBuffer
+      // for this frame; attempting to swap buffers on an existing
+      // LineSegmentsGeometry produced stale renders in r0.162.
+      const posView = new Float32Array(pos.buffer, pos.byteOffset, visibleSegs * 6);
+      const colView = new Float32Array(col.buffer, col.byteOffset, visibleSegs * 6);
+      const geom = new LineSegmentsGeometry();
+      geom.setPositions(posView);
+      geom.setColors(colView);
+      const lines = new LineSegments2(geom, this._printedMat);
+      this.printedGroup.add(lines);
+    }
+    this._printedVertCount = visibleSegs * 2;
 
     const head = moves[Math.min(cursor, moves.length - 1)];
     if (head) {

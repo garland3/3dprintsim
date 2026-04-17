@@ -46,6 +46,9 @@ class SliceResult:
     moves: list[Move]
     layers: list[LayerPaths]
     gcode: str
+    infill_density: float = 0.0
+    top_layers: int = 0
+    bottom_layers: int = 0
 
     def summary(self) -> dict:
         return {
@@ -53,6 +56,9 @@ class SliceResult:
             "move_count": len(self.moves),
             "layer_height": self.layer_height,
             "perimeters": self.perimeters,
+            "infill_density": self.infill_density,
+            "top_layers": self.top_layers,
+            "bottom_layers": self.bottom_layers,
             "total_extrusion": self.moves[-1].e if self.moves else 0.0,
         }
 
@@ -174,6 +180,10 @@ def slice_meshes(
     meshes: list[Mesh],
     layer_height: float = 0.4,
     perimeters: int = 1,
+    infill_density: float = 0.2,
+    top_layers: int = 3,
+    bottom_layers: int = 3,
+    nozzle_width: float = 0.4,
     extrusion_per_mm: float = 0.04,
     travel_speed: float = 120.0,
     print_speed: float = 40.0,
@@ -182,6 +192,12 @@ def slice_meshes(
         raise ValueError("layer_height must be > 0")
     if perimeters < 1:
         raise ValueError("perimeters must be >= 1")
+    if not (0.0 <= infill_density <= 1.0):
+        raise ValueError("infill_density must be in [0, 1]")
+    if top_layers < 0 or bottom_layers < 0:
+        raise ValueError("top_layers and bottom_layers must be >= 0")
+    if nozzle_width <= 0:
+        raise ValueError("nozzle_width must be > 0")
     if not meshes:
         return SliceResult(
             layer_height=layer_height,
@@ -189,6 +205,9 @@ def slice_meshes(
             moves=[],
             layers=[],
             gcode="; empty\n",
+            infill_density=infill_density,
+            top_layers=top_layers,
+            bottom_layers=bottom_layers,
         )
 
     min_z = min(m.min_xyz[2] for m in meshes)
@@ -209,43 +228,89 @@ def slice_meshes(
     # Start somewhere safe
     moves.append(Move(kind="travel", x=0.0, y=0.0, z=5.0, e=0.0))
 
-    for z_target in zs:
-        segs: list[tuple[tuple[float, float], tuple[float, float]]] = []
-        for mesh in meshes:
+    def emit_extrude_to(x: float, y: float, z_target: float) -> None:
+        nonlocal cumulative_e
+        prev = moves[-1]
+        dx = x - prev.x
+        dy = y - prev.y
+        dist = (dx * dx + dy * dy) ** 0.5
+        cumulative_e += dist * extrusion_per_mm
+        moves.append(Move(kind="extrude", x=x, y=y, z=z_target, e=cumulative_e))
+
+    # Pre-compute, for each mesh, the indices of its first and last layers in
+    # the global Z list. We use this to decide whether a given layer is a
+    # top/bottom layer *for that specific mesh*, not for the whole build — a
+    # 10 mm part printed next to a 100 mm part still needs its own top surface.
+    mesh_layer_ranges: list[tuple[int, int]] = []
+    for mesh in meshes:
+        first = None
+        last = None
+        for i, z in enumerate(zs):
+            if mesh.min_xyz[2] - EPS <= z <= mesh.max_xyz[2] + EPS:
+                if first is None:
+                    first = i
+                last = i
+        mesh_layer_ranges.append((first if first is not None else -1,
+                                   last if last is not None else -2))
+
+    for layer_index, z_target in enumerate(zs):
+        # Slice each mesh independently so we can keep its contours and its
+        # "is this my top/bottom layer?" decision co-located per mesh.
+        per_mesh_polylines: list[list[list[tuple[float, float]]]] = []
+        combined_polylines: list[list[tuple[float, float]]] = []
+        for mesh_index, mesh in enumerate(meshes):
             if z_target < mesh.min_xyz[2] or z_target > mesh.max_xyz[2]:
+                per_mesh_polylines.append([])
                 continue
+            segs: list[tuple[tuple[float, float], tuple[float, float]]] = []
             for tri in mesh.triangles:
                 s = _segment_at_z(tri, z_target)
                 if s is not None:
                     segs.append(s)
+            polylines = _chain_segments(segs)
+            per_mesh_polylines.append(polylines)
+            combined_polylines.extend(polylines)
 
-        polylines = _chain_segments(segs)
-        # For "perimeter only" we trace each polyline once per requested perimeter count.
-        # Additional perimeters are emitted as repeated traces (simplification — no offsetting).
-        layer = LayerPaths(z=z_target, contours=polylines)
+        layer = LayerPaths(z=z_target, contours=combined_polylines)
         layers.append(layer)
 
-        for poly in polylines:
-            if len(poly) < 2:
+        # Perimeters — traced once per requested perimeter count.
+        for polylines in per_mesh_polylines:
+            for poly in polylines:
+                if len(poly) < 2:
+                    continue
+                for _ in range(perimeters):
+                    start = poly[0]
+                    moves.append(Move(kind="travel", x=start[0], y=start[1], z=z_target, e=cumulative_e))
+                    for pt in poly[1:]:
+                        emit_extrude_to(pt[0], pt[1], z_target)
+
+        # Infill — decide solid vs sparse *per mesh* using that mesh's own
+        # z range, not the global build. Alternate scan direction per layer.
+        horizontal = (layer_index % 2 == 0)
+        for mesh_index, polylines in enumerate(per_mesh_polylines):
+            if not polylines:
                 continue
-            for _ in range(perimeters):
-                start = poly[0]
-                moves.append(Move(kind="travel", x=start[0], y=start[1], z=z_target, e=cumulative_e))
-                for pt in poly[1:]:
-                    prev = moves[-1]
-                    dx = pt[0] - prev.x
-                    dy = pt[1] - prev.y
-                    dist = (dx * dx + dy * dy) ** 0.5
-                    cumulative_e += dist * extrusion_per_mm
-                    moves.append(
-                        Move(
-                            kind="extrude",
-                            x=pt[0],
-                            y=pt[1],
-                            z=z_target,
-                            e=cumulative_e,
-                        )
-                    )
+            first_idx, last_idx = mesh_layer_ranges[mesh_index]
+            offset_from_bottom = layer_index - first_idx
+            offset_from_top = last_idx - layer_index
+            is_solid = (
+                offset_from_bottom < bottom_layers
+                or offset_from_top < top_layers
+            )
+            if is_solid:
+                spacing: float | None = nozzle_width
+            elif infill_density > 0:
+                spacing = nozzle_width / infill_density
+            else:
+                spacing = None
+
+            if spacing is None:
+                continue
+            infill_segments = _rectilinear_infill(polylines, spacing, horizontal=horizontal)
+            for (a, b) in infill_segments:
+                moves.append(Move(kind="travel", x=a[0], y=a[1], z=z_target, e=cumulative_e))
+                emit_extrude_to(b[0], b[1], z_target)
 
     gcode = _render_gcode(moves, travel_speed, print_speed)
 
@@ -255,7 +320,113 @@ def slice_meshes(
         moves=moves,
         layers=layers,
         gcode=gcode,
+        infill_density=infill_density,
+        top_layers=top_layers,
+        bottom_layers=bottom_layers,
     )
+
+
+def _rectilinear_infill(
+    contours: list[list[tuple[float, float]]],
+    spacing: float,
+    horizontal: bool,
+) -> list[tuple[tuple[float, float], tuple[float, float]]]:
+    """Scan-line rectilinear infill clipped to (closed) contour polygons.
+
+    horizontal=True emits lines parallel to the X axis at varying Y.
+    horizontal=False emits lines parallel to Y at varying X.
+    """
+    closed: list[list[tuple[float, float]]] = []
+    for poly in contours:
+        if len(poly) < 3:
+            continue
+        if abs(poly[0][0] - poly[-1][0]) < 1e-6 and abs(poly[0][1] - poly[-1][1]) < 1e-6:
+            closed.append(poly)
+    if not closed or spacing <= 0:
+        return []
+
+    xs = [p[0] for poly in closed for p in poly]
+    ys = [p[1] for poly in closed for p in poly]
+    if not xs:
+        return []
+    xmin, xmax = min(xs), max(xs)
+    ymin, ymax = min(ys), max(ys)
+
+    segments: list[tuple[tuple[float, float], tuple[float, float]]] = []
+
+    if horizontal:
+        y = ymin + spacing / 2
+        row_index = 0
+        while y < ymax:
+            crossings = _scanline_crossings(closed, y, axis="y")
+            # Zig-zag: reverse every other row so the head doesn't jump back to
+            # x-min each time — this is what real slicers do.
+            if row_index % 2 == 1:
+                pairs = list(zip(crossings[0::2], crossings[1::2]))
+                pairs.reverse()
+                for a, b in pairs:
+                    segments.append(((b, y), (a, y)))
+            else:
+                for i in range(0, len(crossings) - 1, 2):
+                    segments.append(((crossings[i], y), (crossings[i + 1], y)))
+            y += spacing
+            row_index += 1
+    else:
+        x = xmin + spacing / 2
+        col_index = 0
+        while x < xmax:
+            crossings = _scanline_crossings(closed, x, axis="x")
+            if col_index % 2 == 1:
+                pairs = list(zip(crossings[0::2], crossings[1::2]))
+                pairs.reverse()
+                for a, b in pairs:
+                    segments.append(((x, b), (x, a)))
+            else:
+                for i in range(0, len(crossings) - 1, 2):
+                    segments.append(((x, crossings[i]), (x, crossings[i + 1])))
+            x += spacing
+            col_index += 1
+
+    return segments
+
+
+def _scanline_crossings(
+    closed: list[list[tuple[float, float]]],
+    value: float,
+    axis: str,
+) -> list[float]:
+    """Sorted coordinates along the orthogonal axis where a horizontal
+    (axis='y') or vertical (axis='x') scan line crosses the polygon boundary.
+
+    Uses a half-open vertex rule to avoid double-counting horizontal edges at
+    the scan line — the classic even-odd fill convention.
+    """
+    out: list[float] = []
+    for poly in closed:
+        for i in range(len(poly) - 1):
+            a = poly[i]
+            b = poly[i + 1]
+            if axis == "y":
+                ya, yb = a[1], b[1]
+                if ya == yb:
+                    continue
+                if (ya <= value < yb) or (yb <= value < ya):
+                    t = (value - ya) / (yb - ya)
+                    out.append(a[0] + t * (b[0] - a[0]))
+            else:  # axis == "x"
+                xa, xb = a[0], b[0]
+                if xa == xb:
+                    continue
+                if (xa <= value < xb) or (xb <= value < xa):
+                    t = (value - xa) / (xb - xa)
+                    out.append(a[1] + t * (b[1] - a[1]))
+    out.sort()
+    # Collapse near-duplicate crossings (vertex hits) to avoid zero-length fills.
+    deduped: list[float] = []
+    for v in out:
+        if not deduped or abs(v - deduped[-1]) > 1e-6:
+            deduped.append(v)
+    return deduped
 
 
 def _render_gcode(moves: list[Move], travel_speed: float, print_speed: float) -> str:

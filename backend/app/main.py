@@ -28,6 +28,10 @@ class BedSize(BaseModel):
 class SliceRequest(BaseModel):
     layer_height: float = Field(0.4, gt=0)
     perimeters: int = Field(1, ge=1)
+    infill_density: float = Field(0.2, ge=0.0, le=1.0)
+    top_layers: int = Field(3, ge=0)
+    bottom_layers: int = Field(3, ge=0)
+    nozzle_width: float = Field(0.4, gt=0)
 
 
 class SimulationStartRequest(BaseModel):
@@ -134,8 +138,17 @@ def create_app() -> FastAPI:
     def slice_all(req: SliceRequest) -> dict:
         try:
             result = get_service().slice_all(
-                layer_height=req.layer_height, perimeters=req.perimeters
+                layer_height=req.layer_height,
+                perimeters=req.perimeters,
+                infill_density=req.infill_density,
+                top_layers=req.top_layers,
+                bottom_layers=req.bottom_layers,
+                nozzle_width=req.nozzle_width,
             )
+        except ArrangeError as exc:
+            # slice_all() implicitly auto-arranges unplaced parts; surface bed
+            # fit failures as 409 so the UI can distinguish them from validation.
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return result.summary()
