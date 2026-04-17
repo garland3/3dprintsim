@@ -88,18 +88,20 @@ export default function App() {
 
   // Poll the backend for one-shot viewer requests (e.g. MCP-initiated focus).
   // Two-second cadence is fine: this is a developer tool and the polls are
-  // tiny. Only the delta (counter increasing) triggers the local action.
+  // tiny. Any increase over the last known counter triggers focus. The first
+  // observed value is compared against 0 (the service's initial state), so
+  // an MCP call that lands before the UI mounts is still honored.
   useEffect(() => {
     let cancelled = false;
-    let lastFocus = null;
+    let lastFocus = 0;
     const tick = async () => {
       try {
         const r = await api.viewerRequests();
         if (cancelled) return;
-        if (lastFocus !== null && r.focus_request > lastFocus) {
+        if (r.focus_request > lastFocus) {
           focusView();
+          lastFocus = r.focus_request;
         }
-        lastFocus = r.focus_request;
       } catch {
         // intentional swallow: backend hiccups shouldn't crash the UI
       }

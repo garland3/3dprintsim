@@ -385,8 +385,44 @@ def test_mcp_tools_exposed():
         "set_simulation_cursor",
         "get_simulation_frame",
         "set_part_scale",
+        "focus_viewer",
     }
     assert expected <= names
+
+
+def test_viewer_focus_request_is_monotonic(client: TestClient):
+    """POSTing /api/viewer/focus increments the counter the UI polls."""
+    initial = client.get("/api/viewer/requests").json()
+    assert initial == {"focus_request": 0}
+
+    r = client.post("/api/viewer/focus").json()
+    assert r["focus_request"] == 1
+    r = client.post("/api/viewer/focus").json()
+    assert r["focus_request"] == 2
+
+    assert client.get("/api/viewer/requests").json() == {"focus_request": 2}
+
+
+def test_mcp_focus_viewer_increments_counter(client: TestClient):
+    """The focus_viewer MCP tool must bump the same counter as the REST route."""
+    import asyncio
+
+    from app.mcp_server import build_mcp
+
+    mcp = build_mcp()
+
+    async def call_twice():
+        a = await mcp.call_tool("focus_viewer", {})
+        b = await mcp.call_tool("focus_viewer", {})
+        return a, b
+
+    a, b = asyncio.run(call_twice())
+    a_data = a.structured_content or (a.data if hasattr(a, "data") else None)
+    b_data = b.structured_content or (b.data if hasattr(b, "data") else None)
+    assert a_data["focus_request"] == 1
+    assert b_data["focus_request"] == 2
+    # And the HTTP polling endpoint sees the same value.
+    assert client.get("/api/viewer/requests").json() == {"focus_request": 2}
 
 
 def test_mcp_upload_base64_roundtrip(client: TestClient):

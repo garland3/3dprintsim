@@ -65,6 +65,15 @@ export class PrinterScene {
   dispose() {
     cancelAnimationFrame(this._raf);
     window.removeEventListener('resize', this._resize);
+    if (this._inputHandlers) {
+      const { mousedown, contextmenu, wheel, mouseup, mousemove } = this._inputHandlers;
+      this.canvas.removeEventListener('mousedown', mousedown);
+      this.canvas.removeEventListener('contextmenu', contextmenu);
+      this.canvas.removeEventListener('wheel', wheel);
+      window.removeEventListener('mouseup', mouseup);
+      window.removeEventListener('mousemove', mousemove);
+      this._inputHandlers = null;
+    }
     this._disposeGroup(this.toolpathGroup);
     this._disposeGroup(this.printedGroup);
     this.renderer.dispose();
@@ -113,7 +122,13 @@ export class PrinterScene {
     let panning = false;
     let lastX = 0;
     let lastY = 0;
-    c.addEventListener('mousedown', (e) => {
+    // Reusable scratch vectors for pan basis extraction; hoisted so mousemove
+    // doesn't allocate on every frame.
+    const panRight = new THREE.Vector3();
+    const panUp = new THREE.Vector3();
+    const panFwd = new THREE.Vector3();
+
+    const mousedown = (e) => {
       // Right mouse button OR shift+left = pan; plain left = rotate.
       if (e.button === 2 || (e.button === 0 && e.shiftKey)) {
         panning = true;
@@ -127,11 +142,10 @@ export class PrinterScene {
       lastX = e.clientX;
       lastY = e.clientY;
       e.preventDefault();
-    });
-    // Suppress the browser context menu so RMB pan feels natural.
-    c.addEventListener('contextmenu', (e) => e.preventDefault());
-    window.addEventListener('mouseup', () => { dragging = false; panning = false; });
-    window.addEventListener('mousemove', (e) => {
+    };
+    const contextmenu = (e) => e.preventDefault();
+    const mouseup = () => { dragging = false; panning = false; };
+    const mousemove = (e) => {
       if (!dragging && !panning) return;
       const dx = e.clientX - lastX;
       const dy = e.clientY - lastY;
@@ -139,13 +153,14 @@ export class PrinterScene {
       lastY = e.clientY;
       if (panning) {
         // Pan in the camera's own X/Y plane so dragging feels 1:1 regardless
-        // of the current orbit angle.
+        // of the current orbit angle. `_applyOrbit` sets the camera transform
+        // but leaves matrixWorld stale until the next render; force an update
+        // so the basis we read matches what the user is seeing.
         const panScale = this._orbit.radius * 0.0015;
-        const right = new THREE.Vector3();
-        const up = new THREE.Vector3();
-        this.camera.matrixWorld.extractBasis(right, up, new THREE.Vector3());
-        this._orbit.target.addScaledVector(right, -dx * panScale);
-        this._orbit.target.addScaledVector(up, dy * panScale);
+        this.camera.updateMatrixWorld(true);
+        this.camera.matrixWorld.extractBasis(panRight, panUp, panFwd);
+        this._orbit.target.addScaledVector(panRight, -dx * panScale);
+        this._orbit.target.addScaledVector(panUp, dy * panScale);
       } else {
         // CAD-style: dragging the cursor RIGHT rotates the view RIGHT (camera
         // orbits in the same direction the user drags).
@@ -153,13 +168,20 @@ export class PrinterScene {
         this._orbit.polar = Math.max(0.1, Math.min(Math.PI - 0.1, this._orbit.polar + dy * 0.008));
       }
       this._applyOrbit();
-    });
-    c.addEventListener('wheel', (e) => {
+    };
+    const wheel = (e) => {
       e.preventDefault();
       const scale = e.deltaY > 0 ? 1.1 : 1 / 1.1;
       this._orbit.radius = Math.max(50, Math.min(3000, this._orbit.radius * scale));
       this._applyOrbit();
-    }, { passive: false });
+    };
+
+    c.addEventListener('mousedown', mousedown);
+    c.addEventListener('contextmenu', contextmenu);
+    c.addEventListener('wheel', wheel, { passive: false });
+    window.addEventListener('mouseup', mouseup);
+    window.addEventListener('mousemove', mousemove);
+    this._inputHandlers = { mousedown, contextmenu, wheel, mouseup, mousemove };
   }
 
   makeHead() {
