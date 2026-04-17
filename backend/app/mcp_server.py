@@ -7,9 +7,115 @@ ever opening the web UI.
 
 from __future__ import annotations
 
+import ipaddress
+import os
+import socket
+from urllib.parse import urljoin, urlparse
+
+import httpx
 from fastmcp import FastMCP
 
 from .state import get_service
+
+
+# Atlas file-upload handoff: when an Atlas host injects a file into an MCP call
+# it rewrites the user-facing filename into a signed download URL. That URL may
+# arrive either as an absolute URL or as a relative path the tool is expected
+# to resolve against the backend's public base.
+_ATLAS_FETCH_TIMEOUT = 30.0
+# Cap the byte stream we're willing to ingest. Keeps a hostile or accidental
+# multi-GB STL from pinning the event loop and the in-memory triangle list.
+_ATLAS_MAX_BYTES = 200 * 1024 * 1024  # 200 MiB
+
+
+def _backend_public_url() -> str:
+    """Resolved at call time so tests can flip BACKEND_PUBLIC_URL per-case
+    without having to reload this module."""
+    return os.getenv("BACKEND_PUBLIC_URL", "http://localhost:8000")
+
+
+def _normalize_atlas_url(filename: str) -> str:
+    """Resolve an Atlas `filename` handoff to an absolute URL we can GET."""
+    if filename.startswith("/"):
+        return urljoin(_backend_public_url(), filename)
+    return filename
+
+
+def _allowed_hosts() -> set[str]:
+    """Hosts the Atlas downloader is willing to talk to.
+
+    Always includes the configured backend's host (that's where relative
+    `/mcp/files/download/...` paths resolve), plus any operator-supplied
+    ATLAS_ALLOWED_HOSTS entries. Anything else is rejected up front so a
+    hostile prompt can't coerce the server into SSRF requests to cloud
+    metadata, RFC1918 services, or unrelated third-party hosts.
+    """
+    hosts: set[str] = {
+        h.strip().lower()
+        for h in os.getenv("ATLAS_ALLOWED_HOSTS", "").split(",")
+        if h.strip()
+    }
+    backend = urlparse(_backend_public_url()).netloc.lower()
+    if backend:
+        hosts.add(backend)
+    return hosts
+
+
+def _reject_ssrf(url: str) -> None:
+    """Raise ValueError if `url` is not a safe Atlas download target.
+
+    Enforces: http/https scheme, host present, host matches an allowlisted
+    origin (backend or ATLAS_ALLOWED_HOSTS), and — for non-localhost
+    allowlist entries — that the resolved IP is not in an internal/reserved
+    range. Localhost is allowed because the default dev deployment has the
+    backend talking to itself for /mcp/files/download paths.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(f"Atlas URL must be http/https, got {parsed.scheme!r}")
+    host = (parsed.hostname or "").lower()
+    if not host:
+        raise ValueError("Atlas URL missing host")
+    netloc = parsed.netloc.lower()
+    allowed = _allowed_hosts()
+    if netloc not in allowed and host not in allowed:
+        raise ValueError(
+            f"Atlas host {netloc!r} is not in the allowlist; "
+            "set ATLAS_ALLOWED_HOSTS or BACKEND_PUBLIC_URL to permit it"
+        )
+    # Skip the private-IP check for loopback since the default backend runs
+    # on localhost and legitimately resolves to 127.0.0.1/::1.
+    if host in ("localhost", "127.0.0.1", "::1"):
+        return
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror as exc:
+        raise ValueError(f"Atlas host {host!r} failed DNS lookup") from exc
+    for info in infos:
+        addr = info[4][0]
+        try:
+            ip = ipaddress.ip_address(addr)
+        except ValueError:
+            continue
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+            raise ValueError(
+                f"Atlas host {host!r} resolves to internal address {addr}; refusing"
+            )
+
+
+def _atlas_display_name(url: str, fallback: str = "atlas.stl") -> str:
+    """Best-effort filename for display — Atlas URLs expose the original name
+    in the path segment (e.g. /mcp/files/download/<id>/my-model.stl) but many
+    handoffs strip it, so default to something sensible rather than "".
+    """
+    try:
+        path = urlparse(url).path
+    except ValueError:
+        return fallback
+    tail = path.rsplit("/", 1)[-1]
+    if tail and tail.lower().endswith(".stl"):
+        return tail
+    return fallback
 
 
 def build_mcp() -> FastMCP:
@@ -32,6 +138,62 @@ def build_mcp() -> FastMCP:
     def set_bed_size(x_mm: float, y_mm: float, z_mm: float) -> dict:
         """Resize the virtual print bed. Defaults to Prusa i3-style 250x210x210mm."""
         return get_service().set_bed_size(x_mm, y_mm, z_mm)
+
+    @mcp.tool
+    def atlas_upload(
+        filename: str,
+        name: str = "",
+        scale: float = 1.0,
+    ) -> dict:
+        """Upload an STL that the Atlas host has already stashed in its file
+        vault. `filename` is the secure download URL supplied by Atlas — it
+        may be an absolute URL or a relative path (e.g.
+        `/mcp/files/download/abc123?token=xyz`); either is resolved against
+        the backend's public base URL before the GET.
+
+        Use this when the user drops an STL into the chat rather than asking
+        the model to base64-encode the file inline (which blows up both the
+        tool-call size and the context window for real-world parts).
+
+        `name` overrides the display name; otherwise it's derived from the
+        URL path. `scale` works the same as upload_stl (25.4 for inches,
+        0.001 for metres, etc).
+        """
+        if not filename:
+            raise ValueError("filename (Atlas download URL) is required")
+
+        url = _normalize_atlas_url(filename)
+        # Guard against SSRF: enforce http/https, allowlisted hosts, and
+        # reject hosts that resolve to private/loopback/reserved IPs. Must
+        # run *before* the HTTP client opens a connection.
+        _reject_ssrf(url)
+
+        try:
+            # follow_redirects=False keeps a 30x from bouncing the fetch to
+            # an internal host after the allowlist check has already passed.
+            with httpx.Client(timeout=_ATLAS_FETCH_TIMEOUT, follow_redirects=False) as client:
+                with client.stream("GET", url) as resp:
+                    resp.raise_for_status()
+                    chunks: list[bytes] = []
+                    total = 0
+                    for chunk in resp.iter_bytes():
+                        total += len(chunk)
+                        if total > _ATLAS_MAX_BYTES:
+                            raise ValueError(
+                                f"Atlas file exceeds {_ATLAS_MAX_BYTES // (1024 * 1024)} MiB cap"
+                            )
+                        chunks.append(chunk)
+                    data = b"".join(chunks)
+        except httpx.HTTPStatusError as exc:
+            raise ValueError(
+                f"Atlas download failed: HTTP {exc.response.status_code}"
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise ValueError(f"Atlas download failed: {exc}") from exc
+
+        display_name = name.strip() if name and name.strip() else _atlas_display_name(url)
+        part = get_service().add_part_from_bytes(display_name, data, scale=scale)
+        return part.to_public()
 
     @mcp.tool
     def upload_stl(name: str, stl_base64: str, scale: float = 1.0) -> dict:
@@ -83,12 +245,16 @@ def build_mcp() -> FastMCP:
         top_layers: int = 3,
         bottom_layers: int = 3,
         nozzle_width_mm: float = 0.4,
+        support_density: float = 0.25,
     ) -> dict:
         """Slice every loaded part and return a summary.
 
         infill_density is 0..1 (fraction of the layer filled with sparse infill).
-        The first bottom_layers and last top_layers of each part are filled with
-        solid (100%) infill to form proper top/bottom surfaces.
+        Top/bottom/overhang detection is raster-based: the first bottom_layers
+        and last top_layers of each part get solid infill, and any intermediate
+        layer with an overhang or hollow above/below also becomes solid.
+        support_density (0..1) controls how dense the auto-generated support
+        columns are — set to 0 to disable supports entirely.
         """
         result = get_service().slice_all(
             layer_height=layer_height_mm,
@@ -97,6 +263,7 @@ def build_mcp() -> FastMCP:
             top_layers=top_layers,
             bottom_layers=bottom_layers,
             nozzle_width=nozzle_width_mm,
+            support_density=support_density,
         )
         return result.summary()
 

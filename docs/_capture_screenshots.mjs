@@ -10,6 +10,7 @@ import fs from 'fs';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const CUBE20 = path.resolve(here, '..', 'tests', 'fixtures', 'cube20.stl');
 const CUBE10 = path.resolve(here, '..', 'tests', 'fixtures', 'cube10.stl');
+const TSHAPE = path.resolve(here, '..', 'tests', 'fixtures', 'tshape.stl');
 const OUT = path.resolve(here, 'screenshots');
 
 async function waitForIdle(page, ms = 400) {
@@ -145,6 +146,66 @@ async function main() {
   });
   await waitForIdle(page, 400);
   await snap(page, '09-toolpath-closeup');
+
+  console.log('16. overhang T-shape with supports');
+  await resetBackend();
+  await page.goto('http://127.0.0.1:5173/');
+  await page.getByTestId('sidebar').waitFor();
+  await page.getByTestId('file-input').setInputFiles(TSHAPE);
+  await page.getByTestId('parts-list').locator('li').first().waitFor({ timeout: 10_000 });
+  await page.getByTestId('layer-height').fill('1');
+  await page.getByTestId('infill-density').fill('10');
+  await page.getByTestId('support-density').fill('30');
+  await page.getByTestId('slice').click();
+  await page.getByTestId('slice-summary').waitFor();
+  await page.getByTestId('finish-sim').click();
+  await waitForIdle(page, 800);
+  // Focus the camera on the part via the built-in fitter, then tighten the
+  // radius for a close-in depth-legible shot.
+  await page.getByTestId('focus-view').click();
+  await waitForIdle(page, 300);
+  await page.evaluate(() => {
+    const s = window.__printerScene;
+    if (!s) return;
+    s._orbit.radius *= 0.55;
+    s._orbit.polar = Math.PI / 2.6;
+    s._orbit.azimuth = Math.PI / 3.5;
+    s._applyOrbit();
+  });
+  await waitForIdle(page, 400);
+  await snap(page, '16-tshape-supports');
+
+  console.log('17. depth-colored toolpath (cube close-up, mid-print)');
+  await resetBackend();
+  await page.goto('http://127.0.0.1:5173/');
+  await page.getByTestId('sidebar').waitFor();
+  await page.getByTestId('file-input').setInputFiles(CUBE20);
+  await page.getByTestId('parts-list').locator('li').first().waitFor({ timeout: 10_000 });
+  await page.getByTestId('layer-height').fill('1');
+  await page.getByTestId('slice').click();
+  await page.getByTestId('slice-summary').waitFor();
+  await page.getByTestId('start-sim').click();
+  await page.waitForTimeout(1200);
+  const cursor3 = await page.getByTestId('sim-cursor').textContent();
+  const [, total3] = cursor3.split('/').map((s) => parseInt(s.trim(), 10));
+  await page.getByTestId('sim-slider').fill(String(Math.floor(total3 * 0.65)));
+  await page.getByTestId('focus-view').click();
+  await waitForIdle(page, 300);
+  await page.evaluate(() => {
+    const s = window.__printerScene;
+    if (!s) return;
+    s._orbit.radius *= 0.6;
+    s._orbit.polar = Math.PI / 2.5;
+    s._orbit.azimuth = Math.PI / 4.5;
+    s._applyOrbit();
+  });
+  await waitForIdle(page, 400);
+  await snap(page, '17-depth-colored-toolpath');
+
+  console.log('18. legend visible on slice');
+  await page.getByTestId('focus-view').click();
+  await waitForIdle(page, 300);
+  await snap(page, '18-legend-overview');
 
   await browser.close();
   console.log('done.');

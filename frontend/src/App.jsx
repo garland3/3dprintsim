@@ -24,6 +24,7 @@ export default function App() {
   const [infillDensity, setInfillDensity] = useState(0.2);
   const [topLayers, setTopLayers] = useState(3);
   const [bottomLayers, setBottomLayers] = useState(3);
+  const [supportDensity, setSupportDensity] = useState(0.25);
   const [uploadUnit, setUploadUnit] = useState('mm'); // 'mm' | 'in'
   const [scaleDraft, setScaleDraft] = useState({}); // per-part in-progress scale input
   const [error, setError] = useState('');
@@ -177,6 +178,7 @@ export default function App() {
       infill_density: Number(infillDensity),
       top_layers: Number(topLayers),
       bottom_layers: Number(bottomLayers),
+      support_density: Number(supportDensity),
     });
     setSliceSummary(summary);
     const slicePayload = await api.getSlice();
@@ -440,6 +442,18 @@ export default function App() {
           <label>Bot.</label>
           <input type="number" step="1" min="0" value={bottomLayers} onChange={(e) => setBottomLayers(e.target.value)} data-testid="bottom-layers" />
         </div>
+        <div className="row">
+          <label>Support %</label>
+          <input
+            type="number"
+            step="5"
+            min="0"
+            max="100"
+            value={Math.round(supportDensity * 100)}
+            onChange={(e) => setSupportDensity(Math.max(0, Math.min(100, Number(e.target.value))) / 100)}
+            data-testid="support-density"
+          />
+        </div>
         <button
           onClick={handleSlice}
           disabled={parts.length === 0 || isPending('slice')}
@@ -523,6 +537,18 @@ export default function App() {
           {sliceSummary ? ` · ${sliceSummary.layer_count} layers` : ''}
           {sim.total ? ` · ${sim.cursor}/${sim.total}` : ''}
         </div>
+        {sliceSummary && (
+          <div className="legend" data-testid="legend">
+            <div className="legend-row"><span className="swatch" style={{ background: '#2e9ff2' }} />perimeter</div>
+            <div className="legend-row"><span className="swatch" style={{ background: '#ff6130' }} />overhang</div>
+            <div className="legend-row"><span className="swatch" style={{ background: '#f2d14d' }} />solid fill</div>
+            <div className="legend-row"><span className="swatch" style={{ background: '#8c8c9e' }} />sparse infill</div>
+            <div className="legend-row"><span className="swatch" style={{ background: '#58cc8c' }} />support</div>
+            {typeof sliceSummary.support_cell_count === 'number' && (
+              <div className="legend-note">supports: {sliceSummary.support_cell_count} cells</div>
+            )}
+          </div>
+        )}
       </main>
     </div>
   );
