@@ -13,7 +13,7 @@ from dataclasses import asdict, dataclass, field
 
 from .arrange import ArrangeError, ArrangeInput, Placement, arrange
 from .slicer import SliceResult, slice_meshes
-from .stl_loader import Mesh, parse_stl, translate
+from .stl_loader import Mesh, parse_stl, scale_mesh, translate
 
 
 # Prusa i3 MK3S+ default build volume.
@@ -24,28 +24,38 @@ DEFAULT_BED = (250.0, 210.0, 210.0)
 class Part:
     id: str
     name: str
-    mesh: Mesh  # original, unplaced mesh (min corner is its own origin)
+    mesh: Mesh  # original, unplaced, unscaled mesh from the STL file
+    scale: float = 1.0  # user-applied scale factor (e.g. 25.4 for inch → mm)
     placement: Placement | None = None
 
+    def scaled_mesh(self) -> Mesh:
+        """Return the mesh with the user's scale factor applied."""
+        if self.scale == 1.0:
+            return self.mesh
+        return scale_mesh(self.mesh, self.scale)
+
     def placed_mesh(self) -> Mesh:
-        """Return mesh translated so part's own min corner sits at placement x,y and Z=0."""
-        mn = self.mesh.min_xyz
+        """Return mesh scaled, then translated so its min corner sits at placement x,y and Z=0."""
+        base = self.scaled_mesh()
+        mn = base.min_xyz
         dx = -mn[0]
         dy = -mn[1]
         dz = -mn[2]  # drop to bed
         if self.placement is not None:
             dx += self.placement.x
             dy += self.placement.y
-        return translate(self.mesh, dx, dy, dz)
+        return translate(base, dx, dy, dz)
 
     def to_public(self) -> dict:
-        mn = self.mesh.min_xyz
-        mx = self.mesh.max_xyz
+        base = self.scaled_mesh()
+        mn = base.min_xyz
+        mx = base.max_xyz
         size = (mx[0] - mn[0], mx[1] - mn[1], mx[2] - mn[2])
         return {
             "id": self.id,
             "name": self.name,
             "size": list(size),
+            "scale": self.scale,
             "triangle_count": len(self.mesh.triangles),
             "placement": (
                 {"x": self.placement.x, "y": self.placement.y, "rotation_deg": self.placement.rotation_deg}
@@ -90,10 +100,12 @@ class PrinterService:
 
     # --- parts ---
 
-    def add_part_from_bytes(self, name: str, data: bytes) -> Part:
+    def add_part_from_bytes(self, name: str, data: bytes, scale: float = 1.0) -> Part:
+        if scale <= 0:
+            raise ValueError(f"scale must be positive, got {scale}")
         mesh = parse_stl(data)
         part_id = uuid.uuid4().hex[:8]
-        part = Part(id=part_id, name=name, mesh=mesh)
+        part = Part(id=part_id, name=name, mesh=mesh, scale=float(scale))
         with self._lock:
             self.parts[part_id] = part
             # Place the new part on the bed immediately so it's visible without a
@@ -122,8 +134,9 @@ class PrinterService:
         """
         from .arrange import DEFAULT_MARGIN
 
-        mn = part.mesh.min_xyz
-        mx = part.mesh.max_xyz
+        base = part.scaled_mesh()
+        mn = base.min_xyz
+        mx = base.max_xyz
         w = mx[0] - mn[0]
         d = mx[1] - mn[1]
         bx, by, _ = self.bed_size
@@ -136,12 +149,36 @@ class PrinterService:
         y = (by - d) / 2
         return Placement(part_id=part.id, x=x, y=y, rotation_deg=0.0)
 
-    def add_part_from_base64(self, name: str, b64: str) -> Part:
+    def add_part_from_base64(self, name: str, b64: str, scale: float = 1.0) -> Part:
         try:
             data = base64.b64decode(b64, validate=False)
         except Exception as exc:
             raise ValueError(f"invalid base64 STL: {exc}") from exc
-        return self.add_part_from_bytes(name, data)
+        return self.add_part_from_bytes(name, data, scale=scale)
+
+    def set_part_scale(self, part_id: str, scale: float) -> Part:
+        """Apply a new scale factor to a part and re-place it on the bed."""
+        if scale <= 0:
+            raise ValueError(f"scale must be positive, got {scale}")
+        with self._lock:
+            if part_id not in self.parts:
+                raise KeyError(f"unknown part {part_id}")
+            part = self.parts[part_id]
+            part.scale = float(scale)
+            # Re-place: the footprint just changed, so the previous placement
+            # may no longer fit or be centered.
+            if len(self.parts) == 1:
+                try:
+                    part.placement = self._center_placement(part)
+                except ArrangeError:
+                    part.placement = None
+            else:
+                try:
+                    self._auto_arrange_locked()
+                except ArrangeError:
+                    part.placement = None
+            self._invalidate_slice()
+            return part
 
     def remove_part(self, part_id: str) -> None:
         with self._lock:
@@ -166,8 +203,9 @@ class PrinterService:
     def _auto_arrange_locked(self) -> list[Placement]:
         inputs = []
         for part in self.parts.values():
-            w = part.mesh.max_xyz[0] - part.mesh.min_xyz[0]
-            d = part.mesh.max_xyz[1] - part.mesh.min_xyz[1]
+            base = part.scaled_mesh()
+            w = base.max_xyz[0] - base.min_xyz[0]
+            d = base.max_xyz[1] - base.min_xyz[1]
             inputs.append(ArrangeInput(part_id=part.id, width=w, depth=d))
         bx, by, _ = self.bed_size
         placements = arrange(inputs, bx, by)

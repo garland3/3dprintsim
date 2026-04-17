@@ -34,9 +34,19 @@ def build_mcp() -> FastMCP:
         return get_service().set_bed_size(x_mm, y_mm, z_mm)
 
     @mcp.tool
-    def upload_stl(name: str, stl_base64: str) -> dict:
-        """Upload an STL file as base64 bytes. Returns the new part's metadata."""
-        part = get_service().add_part_from_base64(name, stl_base64)
+    def upload_stl(name: str, stl_base64: str, scale: float = 1.0) -> dict:
+        """Upload an STL file as base64 bytes. Returns the new part's metadata.
+
+        `scale` is a linear multiplier applied to every vertex at import — pass
+        25.4 for an STL authored in inches, 0.001 for metres, etc.
+        """
+        part = get_service().add_part_from_base64(name, stl_base64, scale=scale)
+        return part.to_public()
+
+    @mcp.tool
+    def set_part_scale(part_id: str, scale: float) -> dict:
+        """Resize a loaded part by a linear scale factor (e.g. 2.0 doubles every dimension)."""
+        part = get_service().set_part_scale(part_id, scale)
         return part.to_public()
 
     @mcp.tool

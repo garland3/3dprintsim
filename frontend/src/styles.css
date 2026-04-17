@@ -77,17 +77,61 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
   margin-bottom: 6px;
   display: flex;
   justify-content: space-between;
-  align-items: center;
+  align-items: flex-start;
+  gap: 8px;
   font-size: 12px;
 }
+.parts-list .part-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
 .parts-list .meta { color: #8b9299; font-size: 11px; }
+.parts-list .part-scale {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  margin-top: 4px;
+}
+.parts-list .part-scale label { font-size: 11px; color: #8b9299; }
+.parts-list .part-scale input { width: 70px; padding: 4px 6px; font-size: 12px; }
+.parts-list .part-scale button { padding: 4px 8px; font-size: 11px; min-width: 48px; min-height: 22px; }
 .parts-list .remove {
   background: transparent;
   color: #c04040;
   padding: 2px 6px;
   font-size: 16px;
   line-height: 1;
+  min-width: 22px;
+  min-height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
 }
+
+select {
+  background: #1a1f25;
+  color: #e6e7e9;
+  border: 1px solid #2a313a;
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-size: 13px;
+}
+
+/* In-button spinner: inherits the surrounding text color (matches primary /
+   secondary / danger button contexts). Fixed size keeps the button from
+   jumping when the label is swapped out. */
+.spinner {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  vertical-align: middle;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+button { min-height: 32px; display: inline-flex; align-items: center; justify-content: center; gap: 6px; }
+
+.dropzone.busy { cursor: progress; opacity: 0.8; }
 
 .status {
   background: #1a1f25;

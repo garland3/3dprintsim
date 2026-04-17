@@ -9,7 +9,7 @@ from __future__ import annotations
 import contextlib
 from dataclasses import asdict
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
@@ -44,6 +44,10 @@ class SimulationStepRequest(BaseModel):
 
 class SimulationCursorRequest(BaseModel):
     cursor: int = Field(0, ge=0)
+
+
+class PartScaleRequest(BaseModel):
+    scale: float = Field(gt=0)
 
 
 def create_app() -> FastAPI:
@@ -89,10 +93,30 @@ def create_app() -> FastAPI:
         return get_service().set_bed_size(body.x, body.y, body.z)
 
     @app.post("/api/parts/upload")
-    async def upload(file: UploadFile = File(...)) -> dict:
+    async def upload(
+        file: UploadFile = File(...),
+        scale: float = Form(1.0),
+    ) -> dict:
+        """Upload an STL.
+
+        Pass `scale` as a form field to convert non-mm units at import time —
+        e.g. `scale=25.4` for an STL authored in inches.
+        """
         data = await file.read()
         try:
-            part = get_service().add_part_from_bytes(file.filename or "part.stl", data)
+            part = get_service().add_part_from_bytes(
+                file.filename or "part.stl", data, scale=scale
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return part.to_public()
+
+    @app.post("/api/parts/{part_id}/scale")
+    def set_part_scale(part_id: str, body: PartScaleRequest) -> dict:
+        try:
+            part = get_service().set_part_scale(part_id, body.scale)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return part.to_public()

@@ -115,6 +115,29 @@ def parse_stl(data: bytes) -> Mesh:
     return Mesh(triangles=tris, min_xyz=mn, max_xyz=mx)
 
 
+def scale_mesh(mesh: Mesh, factor: float) -> Mesh:
+    """Return a copy of `mesh` with every vertex coordinate multiplied by `factor`.
+
+    Useful for unit conversion (inches → mm is `factor=25.4`) and for letting
+    the user resize a part after it's been uploaded.
+    """
+    if factor <= 0:
+        raise ValueError(f"scale factor must be positive, got {factor}")
+    tris = [
+        Triangle(
+            (t.v0[0] * factor, t.v0[1] * factor, t.v0[2] * factor),
+            (t.v1[0] * factor, t.v1[1] * factor, t.v1[2] * factor),
+            (t.v2[0] * factor, t.v2[1] * factor, t.v2[2] * factor),
+        )
+        for t in mesh.triangles
+    ]
+    return Mesh(
+        triangles=tris,
+        min_xyz=(mesh.min_xyz[0] * factor, mesh.min_xyz[1] * factor, mesh.min_xyz[2] * factor),
+        max_xyz=(mesh.max_xyz[0] * factor, mesh.max_xyz[1] * factor, mesh.max_xyz[2] * factor),
+    )
+
+
 def translate(mesh: Mesh, dx: float, dy: float, dz: float) -> Mesh:
     tris = [
         Triangle(
