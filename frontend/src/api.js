@@ -29,11 +29,11 @@ export const api = {
   removePart: (id) => fetch(`/api/parts/${id}`, { method: 'DELETE' }).then(json),
   clearParts: () => fetch('/api/parts/clear', { method: 'POST' }).then(json),
   arrange: () => fetch('/api/arrange', { method: 'POST' }).then(json),
-  slice: (layer_height, perimeters) =>
+  slice: (params) =>
     fetch('/api/slice', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ layer_height, perimeters }),
+      body: JSON.stringify(params),
     }).then(json),
   getSlice: () => fetch('/api/slice').then(json),
   gcode: () => fetch('/api/gcode').then((r) => r.text()),

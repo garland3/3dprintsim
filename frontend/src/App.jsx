@@ -12,6 +12,9 @@ export default function App() {
   const [sim, setSim] = useState({ running: false, cursor: 0, total: 0, speed: 1 });
   const [layerHeight, setLayerHeight] = useState(0.4);
   const [perimeters, setPerimeters] = useState(1);
+  const [infillDensity, setInfillDensity] = useState(0.2);
+  const [topLayers, setTopLayers] = useState(3);
+  const [bottomLayers, setBottomLayers] = useState(3);
   const [error, setError] = useState('');
   const [dragging, setDragging] = useState(false);
 
@@ -72,10 +75,9 @@ export default function App() {
     if (!file) return;
     setError('');
     try {
+      // Upload: the backend now centers a single part and re-packs when there
+      // are multiple, so we don't need a second /arrange round-trip from here.
       await api.upload(file);
-      await refreshState();
-      // Auto-arrange to mimic what users expect after uploading.
-      await api.arrange();
       await refreshState();
     } catch (e) {
       setError(String(e));
@@ -93,7 +95,13 @@ export default function App() {
   const handleSlice = async () => {
     setError('');
     try {
-      const summary = await api.slice(Number(layerHeight), Number(perimeters));
+      const summary = await api.slice({
+        layer_height: Number(layerHeight),
+        perimeters: Number(perimeters),
+        infill_density: Number(infillDensity),
+        top_layers: Number(topLayers),
+        bottom_layers: Number(bottomLayers),
+      });
       setSliceSummary(summary);
       const slicePayload = await api.getSlice();
       if (sceneRef.current && slicePayload.ready) {
@@ -245,6 +253,22 @@ export default function App() {
           <input type="number" step="0.1" value={layerHeight} onChange={(e) => setLayerHeight(e.target.value)} data-testid="layer-height" />
           <label>Peri.</label>
           <input type="number" step="1" value={perimeters} onChange={(e) => setPerimeters(e.target.value)} data-testid="perimeters" />
+        </div>
+        <div className="row">
+          <label>Infill %</label>
+          <input
+            type="number"
+            step="5"
+            min="0"
+            max="100"
+            value={Math.round(infillDensity * 100)}
+            onChange={(e) => setInfillDensity(Math.max(0, Math.min(100, Number(e.target.value))) / 100)}
+            data-testid="infill-density"
+          />
+          <label>Top</label>
+          <input type="number" step="1" min="0" value={topLayers} onChange={(e) => setTopLayers(e.target.value)} data-testid="top-layers" />
+          <label>Bot.</label>
+          <input type="number" step="1" min="0" value={bottomLayers} onChange={(e) => setBottomLayers(e.target.value)} data-testid="bottom-layers" />
         </div>
         <button onClick={handleSlice} disabled={parts.length === 0} data-testid="slice">Slice</button>
 
