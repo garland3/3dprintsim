@@ -67,3 +67,20 @@ cd backend && pytest
 # Playwright E2E (starts backend + frontend via config)
 cd tests && npm install && npx playwright test
 ```
+
+## Docker
+
+A RHEL 9 (UBI 9) image builds both services into one container:
+
+```bash
+docker build -t 3dprintsim .
+docker run --rm -p 8000:8000 -p 5173:5173 3dprintsim
+```
+
+See [`docs/docker.md`](docs/docker.md) for details.
+
+## Documentation
+
+Full walkthrough with screenshots lives under [`docs/`](docs/README.md) —
+architecture, HTTP API, MCP tools, slicer internals, frontend layout, and
+the screenshot pipeline.
