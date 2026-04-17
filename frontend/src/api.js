@@ -1,6 +1,11 @@
 // Thin wrapper over the backend REST API. Deliberately no auth, no retries —
 // this is a developer tool running on localhost.
 
+// Printer state is dynamic: parts, slice, and simulation cursor all change
+// without cache-busting URL params. Tell the browser not to cache GETs so we
+// never show stale data after a backend restart or a sibling POST.
+const GET = { cache: 'no-store' };
+
 async function json(resp) {
   if (!resp.ok) {
     const text = await resp.text();
@@ -11,8 +16,8 @@ async function json(resp) {
 }
 
 export const api = {
-  health: () => fetch('/api/health').then(json),
-  state: () => fetch('/api/state').then(json),
+  health: () => fetch('/api/health', GET).then(json),
+  state: () => fetch('/api/state', GET).then(json),
   setBed: (x, y, z) =>
     fetch('/api/bed', {
       method: 'POST',
@@ -24,8 +29,8 @@ export const api = {
     fd.append('file', file);
     return fetch('/api/parts/upload', { method: 'POST', body: fd }).then(json);
   },
-  listParts: () => fetch('/api/parts').then(json),
-  partGeometry: (id) => fetch(`/api/parts/${id}/geometry`).then(json),
+  listParts: () => fetch('/api/parts', GET).then(json),
+  partGeometry: (id) => fetch(`/api/parts/${id}/geometry`, GET).then(json),
   removePart: (id) => fetch(`/api/parts/${id}`, { method: 'DELETE' }).then(json),
   clearParts: () => fetch('/api/parts/clear', { method: 'POST' }).then(json),
   arrange: () => fetch('/api/arrange', { method: 'POST' }).then(json),
@@ -35,8 +40,8 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(params),
     }).then(json),
-  getSlice: () => fetch('/api/slice').then(json),
-  gcode: () => fetch('/api/gcode').then((r) => r.text()),
+  getSlice: () => fetch('/api/slice', GET).then(json),
+  gcode: () => fetch('/api/gcode', GET).then((r) => r.text()),
   startSim: (speed = 1.0) =>
     fetch('/api/simulation/start', {
       method: 'POST',
