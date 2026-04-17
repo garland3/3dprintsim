@@ -7,7 +7,9 @@ ever opening the web UI.
 
 from __future__ import annotations
 
+import ipaddress
 import os
+import socket
 from urllib.parse import urljoin, urlparse
 
 import httpx
@@ -20,18 +22,85 @@ from .state import get_service
 # it rewrites the user-facing filename into a signed download URL. That URL may
 # arrive either as an absolute URL or as a relative path the tool is expected
 # to resolve against the backend's public base.
-_BACKEND_PUBLIC_URL = os.getenv("BACKEND_PUBLIC_URL", "http://localhost:8000")
 _ATLAS_FETCH_TIMEOUT = 30.0
 # Cap the byte stream we're willing to ingest. Keeps a hostile or accidental
 # multi-GB STL from pinning the event loop and the in-memory triangle list.
 _ATLAS_MAX_BYTES = 200 * 1024 * 1024  # 200 MiB
 
 
+def _backend_public_url() -> str:
+    """Resolved at call time so tests can flip BACKEND_PUBLIC_URL per-case
+    without having to reload this module."""
+    return os.getenv("BACKEND_PUBLIC_URL", "http://localhost:8000")
+
+
 def _normalize_atlas_url(filename: str) -> str:
     """Resolve an Atlas `filename` handoff to an absolute URL we can GET."""
     if filename.startswith("/"):
-        return urljoin(_BACKEND_PUBLIC_URL, filename)
+        return urljoin(_backend_public_url(), filename)
     return filename
+
+
+def _allowed_hosts() -> set[str]:
+    """Hosts the Atlas downloader is willing to talk to.
+
+    Always includes the configured backend's host (that's where relative
+    `/mcp/files/download/...` paths resolve), plus any operator-supplied
+    ATLAS_ALLOWED_HOSTS entries. Anything else is rejected up front so a
+    hostile prompt can't coerce the server into SSRF requests to cloud
+    metadata, RFC1918 services, or unrelated third-party hosts.
+    """
+    hosts: set[str] = {
+        h.strip().lower()
+        for h in os.getenv("ATLAS_ALLOWED_HOSTS", "").split(",")
+        if h.strip()
+    }
+    backend = urlparse(_backend_public_url()).netloc.lower()
+    if backend:
+        hosts.add(backend)
+    return hosts
+
+
+def _reject_ssrf(url: str) -> None:
+    """Raise ValueError if `url` is not a safe Atlas download target.
+
+    Enforces: http/https scheme, host present, host matches an allowlisted
+    origin (backend or ATLAS_ALLOWED_HOSTS), and — for non-localhost
+    allowlist entries — that the resolved IP is not in an internal/reserved
+    range. Localhost is allowed because the default dev deployment has the
+    backend talking to itself for /mcp/files/download paths.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(f"Atlas URL must be http/https, got {parsed.scheme!r}")
+    host = (parsed.hostname or "").lower()
+    if not host:
+        raise ValueError("Atlas URL missing host")
+    netloc = parsed.netloc.lower()
+    allowed = _allowed_hosts()
+    if netloc not in allowed and host not in allowed:
+        raise ValueError(
+            f"Atlas host {netloc!r} is not in the allowlist; "
+            "set ATLAS_ALLOWED_HOSTS or BACKEND_PUBLIC_URL to permit it"
+        )
+    # Skip the private-IP check for loopback since the default backend runs
+    # on localhost and legitimately resolves to 127.0.0.1/::1.
+    if host in ("localhost", "127.0.0.1", "::1"):
+        return
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror as exc:
+        raise ValueError(f"Atlas host {host!r} failed DNS lookup") from exc
+    for info in infos:
+        addr = info[4][0]
+        try:
+            ip = ipaddress.ip_address(addr)
+        except ValueError:
+            continue
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+            raise ValueError(
+                f"Atlas host {host!r} resolves to internal address {addr}; refusing"
+            )
 
 
 def _atlas_display_name(url: str, fallback: str = "atlas.stl") -> str:
@@ -94,9 +163,15 @@ def build_mcp() -> FastMCP:
             raise ValueError("filename (Atlas download URL) is required")
 
         url = _normalize_atlas_url(filename)
+        # Guard against SSRF: enforce http/https, allowlisted hosts, and
+        # reject hosts that resolve to private/loopback/reserved IPs. Must
+        # run *before* the HTTP client opens a connection.
+        _reject_ssrf(url)
 
         try:
-            with httpx.Client(timeout=_ATLAS_FETCH_TIMEOUT, follow_redirects=True) as client:
+            # follow_redirects=False keeps a 30x from bouncing the fetch to
+            # an internal host after the allowlist check has already passed.
+            with httpx.Client(timeout=_ATLAS_FETCH_TIMEOUT, follow_redirects=False) as client:
                 with client.stream("GET", url) as resp:
                     resp.raise_for_status()
                     chunks: list[bytes] = []

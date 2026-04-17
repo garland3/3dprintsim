@@ -64,8 +64,9 @@ For each layer, for each mesh:
    on overhang" trick). Each extrude move is tagged `perimeter` or
    `overhang_perimeter`.
 3. **Infill**: rectilinear scan-line fill clipped to the contours. The
-   role on each extrude move is one of `infill_solid`, `infill_sparse`,
-   `bottom`, or `top`, based on the classification above.
+   role on each extrude move is one of `infill_sparse`, `bottom`, or
+   `top` based on the classification above (solid fills get `top` or
+   `bottom` depending on which surface they serve).
 4. **Supports**: every cell in the per-layer support set (computed once
    by `compute_support_cells()`) emits a short stub at the cell center.
    Stubs sub-sample by `support_density` — 0.25 → every 4th cell on the
@@ -98,8 +99,8 @@ class Move:
     y: float
     z: float
     e: float   # cumulative extruder position, mm
-    role: str  # "perimeter" | "overhang_perimeter" | "infill_solid" |
-               # "infill_sparse" | "bottom" | "top" | "support" | "travel"
+    role: str  # "perimeter" | "overhang_perimeter" | "infill_sparse" |
+               # "bottom" | "top" | "support" | "travel"
 ```
 
 The frontend animates `moves` directly — no G-code re-parsing. The role

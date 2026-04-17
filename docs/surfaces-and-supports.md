@@ -112,7 +112,7 @@ toolpath in a way that's actually readable:
 | `perimeter` | Standard outer wall trace | Blue |
 | `overhang_perimeter` | Extra perimeter added on overhang layers | Hot orange |
 | `infill_sparse` | Sparse rectilinear fill (mid-layers, not an overhang) | Grey |
-| `infill_solid` / `top` | Solid fill at top-surface cells | Pale yellow-green |
+| `top` | Solid fill at top-surface cells | Pale yellow-green |
 | `bottom` | Solid fill at bottom-surface or overhang cells | Amber |
 | `support` | Auto-generated support stubs | Muted green |
 | `travel` | Non-extrude move | Not drawn |

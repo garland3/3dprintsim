@@ -213,6 +213,30 @@ def test_slice_solid_top_bottom_more_than_sparse_middle(client: TestClient):
     assert min(solid_counts) > max(middle_counts)
 
 
+def test_slice_layer_zero_is_not_an_overhang(client: TestClient):
+    """Layer 0 sits on the bed, not in the air. It must not get tagged as an
+    overhang (which would add an extra perimeter pass and an overhang role to
+    every cell — wrong for a plain cube on the bed)."""
+    upload_cube(client, size=10.0)
+    client.post(
+        "/api/slice",
+        json={"layer_height": 1.0, "perimeters": 1, "infill_density": 0.0,
+              "top_layers": 0, "bottom_layers": 0, "support_density": 0},
+    )
+    payload = client.get("/api/slice").json()
+    # The lowest-z extrude moves are layer 0. None of them should carry the
+    # overhang_perimeter role because there's no overhang — it's the first
+    # layer of a flat-bottomed cube.
+    zs = sorted({round(m["z"], 3) for m in payload["moves"] if m["kind"] == "extrude"})
+    z0 = zs[0]
+    layer0 = [m for m in payload["moves"] if m["kind"] == "extrude" and round(m["z"], 3) == z0]
+    assert layer0, "expected at least one extrude move on layer 0"
+    roles = {m.get("role") for m in layer0}
+    assert "overhang_perimeter" not in roles, (
+        f"layer 0 must not be classified as overhang; saw roles {roles}"
+    )
+
+
 def test_slice_per_part_solid_layers_respect_per_part_height(client: TestClient):
     """Short parts should get solid top layers even when printed alongside taller parts.
 
@@ -253,6 +277,18 @@ def test_slice_per_part_solid_layers_respect_per_part_height(client: TestClient)
         assert short_moves_by_z[z] >= 10, (
             f"layer at z={z} has only {short_moves_by_z[z]} moves — looks sparse"
         )
+
+
+def test_slice_support_cell_count_zero_when_disabled(client: TestClient):
+    """support_density=0 disables support generation; the summary must report
+    0 cells, not the latent count of overhangs the mask walk would find."""
+    upload_cube(client, size=10.0)
+    r = client.post(
+        "/api/slice",
+        json={"layer_height": 1.0, "support_density": 0.0},
+    ).json()
+    assert r["support_density"] == 0.0
+    assert r["support_cell_count"] == 0
 
 
 def test_upload_oversize_part_stays_unplaced_and_slice_returns_409(client: TestClient):

@@ -10,9 +10,10 @@ For each layer Z we:
      100% spacing on solid regions (top/bottom/overhang), sparse spacing
      elsewhere, and sparse support columns below unreachable overhangs.
 
-Each emitted Move is tagged with a `role` ("perimeter", "infill_solid",
-"infill_sparse", "support", "travel") so the viewer can color the toolpath
-by function and the user can actually see shape instead of one orange blob.
+Each emitted Move is tagged with a `role` ("perimeter",
+"overhang_perimeter", "bottom", "top", "infill_sparse", "support",
+"travel") so the viewer can color the toolpath by function and the user
+can actually see shape instead of one orange blob.
 """
 
 from __future__ import annotations
@@ -32,11 +33,13 @@ from .surfaces import (
 
 
 MoveKind = Literal["travel", "extrude"]
+# Solid fills are tagged "top" or "bottom" depending on which surface they
+# serve; there's no bare "infill_solid" role on the wire because the
+# top/bottom split is what the viewer wants for coloring.
 MoveRole = Literal[
     "travel",
     "perimeter",
     "overhang_perimeter",
-    "infill_solid",
     "infill_sparse",
     "support",
     "bottom",
@@ -295,12 +298,19 @@ def slice_meshes(
 
     # Pre-pass 2: per-mesh support cells. Computed from the mask stack alone,
     # so concave parts (cups, brackets) and real overhangs (letter T, fidget
-    # spinner arms) both get proper columns.
-    mesh_support: list[list[set]] = [
-        compute_support_cells(masks) for masks in mesh_layer_masks
-    ]
-
-    total_support_cells = sum(sum(len(s) for s in layers_) for layers_ in mesh_support)
+    # spinner arms) both get proper columns. When support_density==0 the
+    # user has opted out, so we skip the walk-down entirely — that also
+    # keeps `support_cell_count` honest (0 emitted, 0 reported).
+    if support_density > 0:
+        mesh_support: list[list[set]] = [
+            compute_support_cells(masks) for masks in mesh_layer_masks
+        ]
+        total_support_cells = sum(
+            sum(len(s) for s in layers_) for layers_ in mesh_support
+        )
+    else:
+        mesh_support = [[set() for _ in masks] for masks in mesh_layer_masks]
+        total_support_cells = 0
 
     # Emission pass: per layer, iterate meshes and write perimeters, infill,
     # and the support row for that layer.
@@ -318,14 +328,16 @@ def slice_meshes(
 
             masks = mesh_layer_masks[mesh_index]
             here = masks[layer_index]
-            below = masks[layer_index - 1] if layer_index > 0 else frozenset()
 
-            # Overhang = cells of this layer that weren't solid on the layer
-            # below. We treat overhangs as bottom surfaces (the filament there
-            # is being bridged/extruded into air) which means:
-            #   - solid infill spacing over the overhang region,
-            #   - an extra perimeter pass for a cleaner bottom edge.
-            overhangs = overhang_cells(here, below)
+            # Layer 0 sits on the bed, not in the air — it must never be
+            # classified as an overhang even though `mask[L-1]` is empty by
+            # convention. Without this, every print's first layer would get
+            # an extra perimeter and overhang role, which is wrong.
+            if layer_index > 0:
+                below = masks[layer_index - 1]
+                overhangs = overhang_cells(here, below)
+            else:
+                overhangs = frozenset()
             top_cells = top_surface_cells(masks, layer_index, top_layers)
             bot_cells = bottom_surface_cells(masks, layer_index, bottom_layers)
             solid_cells = top_cells | bot_cells | overhangs

@@ -101,15 +101,13 @@ test('support density of 0 suppresses support moves', async ({ page, request }) 
   expect(hasSupport).toBe(false);
 });
 
-test('atlas_upload MCP tool accepts a URL and adds a part', async ({ request }) => {
-  // Atlas hands off a signed download URL; the backend itself serves geometry
-  // so we use its own /api/parts/upload-like endpoint. But the real-world
-  // test here is that atlas_upload accepts an absolute URL (we use the
-  // backend's own HTTP for simplicity) and the part shows up in state.
-  //
-  // Skipped in this file because it requires uv+python. See the backend
-  // test suite (tests/test_atlas_upload.py) for the authoritative coverage.
-  // Keeping a smoke test here only for the tool listing.
+test('atlas_upload is advertised in the MCP tool list', async ({ request }) => {
+  // Smoke test only: the authoritative end-to-end coverage for atlas_upload
+  // (URL fetch, SSRF rejection, allowlist, display-name derivation) lives in
+  // backend/tests/test_atlas_upload.py where we can drive httpx.MockTransport.
+  // Here we just confirm the tool is discoverable on the live MCP endpoint so
+  // an Atlas host that introspects `list_tools()` knows to route file uploads
+  // through it.
   const { spawnSync } = await import('child_process');
   const BACKEND_DIR = path.resolve(here, '../../backend');
   const res = spawnSync('uv', ['run', '--frozen', 'python', '-c', `

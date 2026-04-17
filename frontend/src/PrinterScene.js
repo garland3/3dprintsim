@@ -23,7 +23,6 @@ const ROLE_BASE = {
   perimeter:          [0.18, 0.62, 0.95],   // cool cyan/blue: walls
   overhang_perimeter: [1.00, 0.38, 0.18],   // hot orange: unsupported edges pop
   infill_sparse:      [0.55, 0.55, 0.62],   // dim grey: interior lattice
-  infill_solid:       [0.95, 0.82, 0.30],   // warm yellow: solid fill
   bottom:             [0.95, 0.55, 0.20],   // amber: bottom/overhang fills
   top:                [0.85, 0.90, 0.45],   // pale yellow-green: ceilings
   support:            [0.35, 0.80, 0.55],   // muted green: easy to subtract visually

@@ -101,3 +101,22 @@ Failures are surfaced as clean `ValueError`s — a 404 from Atlas, a
 truncated stream, or a file over the 200 MiB cap all raise without leaving
 a half-loaded part in the state. Coverage lives in
 [`backend/tests/test_atlas_upload.py`](../backend/tests/test_atlas_upload.py).
+
+### SSRF hardening
+
+The tool is reachable from any MCP client, so every URL is validated before
+a socket is opened:
+
+- Scheme must be `http` or `https`.
+- Host must match the backend's (`BACKEND_PUBLIC_URL`) origin, or an entry
+  in `ATLAS_ALLOWED_HOSTS` (comma-separated `host[:port]` list).
+- For non-loopback hosts the resolved IP must be public — requests whose
+  DNS lands on private, loopback, link-local, or reserved ranges are
+  rejected with a clear error.
+- `follow_redirects` is off, so a 302 from an allowlisted host to an
+  internal one can't bypass the check.
+
+A hostile prompt therefore can't coerce the server into fetching
+`http://169.254.169.254/latest/meta-data/...` or internal admin panels;
+the only legitimate targets are the backend's own download routes and any
+Atlas origin the operator has explicitly allowlisted.
