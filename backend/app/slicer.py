@@ -224,7 +224,6 @@ def slice_meshes(
     moves: list[Move] = []
     layers: list[LayerPaths] = []
     cumulative_e = 0.0
-    total_layers = len(zs)
 
     # Start somewhere safe
     moves.append(Move(kind="travel", x=0.0, y=0.0, z=5.0, e=0.0))
@@ -238,43 +237,76 @@ def slice_meshes(
         cumulative_e += dist * extrusion_per_mm
         moves.append(Move(kind="extrude", x=x, y=y, z=z_target, e=cumulative_e))
 
+    # Pre-compute, for each mesh, the indices of its first and last layers in
+    # the global Z list. We use this to decide whether a given layer is a
+    # top/bottom layer *for that specific mesh*, not for the whole build — a
+    # 10 mm part printed next to a 100 mm part still needs its own top surface.
+    mesh_layer_ranges: list[tuple[int, int]] = []
+    for mesh in meshes:
+        first = None
+        last = None
+        for i, z in enumerate(zs):
+            if mesh.min_xyz[2] - EPS <= z <= mesh.max_xyz[2] + EPS:
+                if first is None:
+                    first = i
+                last = i
+        mesh_layer_ranges.append((first if first is not None else -1,
+                                   last if last is not None else -2))
+
     for layer_index, z_target in enumerate(zs):
-        segs: list[tuple[tuple[float, float], tuple[float, float]]] = []
-        for mesh in meshes:
+        # Slice each mesh independently so we can keep its contours and its
+        # "is this my top/bottom layer?" decision co-located per mesh.
+        per_mesh_polylines: list[list[list[tuple[float, float]]]] = []
+        combined_polylines: list[list[tuple[float, float]]] = []
+        for mesh_index, mesh in enumerate(meshes):
             if z_target < mesh.min_xyz[2] or z_target > mesh.max_xyz[2]:
+                per_mesh_polylines.append([])
                 continue
+            segs: list[tuple[tuple[float, float], tuple[float, float]]] = []
             for tri in mesh.triangles:
                 s = _segment_at_z(tri, z_target)
                 if s is not None:
                     segs.append(s)
+            polylines = _chain_segments(segs)
+            per_mesh_polylines.append(polylines)
+            combined_polylines.extend(polylines)
 
-        polylines = _chain_segments(segs)
-        # For "perimeter only" we trace each polyline once per requested perimeter count.
-        # Additional perimeters are emitted as repeated traces (simplification — no offsetting).
-        layer = LayerPaths(z=z_target, contours=polylines)
+        layer = LayerPaths(z=z_target, contours=combined_polylines)
         layers.append(layer)
 
-        for poly in polylines:
-            if len(poly) < 2:
+        # Perimeters — traced once per requested perimeter count.
+        for polylines in per_mesh_polylines:
+            for poly in polylines:
+                if len(poly) < 2:
+                    continue
+                for _ in range(perimeters):
+                    start = poly[0]
+                    moves.append(Move(kind="travel", x=start[0], y=start[1], z=z_target, e=cumulative_e))
+                    for pt in poly[1:]:
+                        emit_extrude_to(pt[0], pt[1], z_target)
+
+        # Infill — decide solid vs sparse *per mesh* using that mesh's own
+        # z range, not the global build. Alternate scan direction per layer.
+        horizontal = (layer_index % 2 == 0)
+        for mesh_index, polylines in enumerate(per_mesh_polylines):
+            if not polylines:
                 continue
-            for _ in range(perimeters):
-                start = poly[0]
-                moves.append(Move(kind="travel", x=start[0], y=start[1], z=z_target, e=cumulative_e))
-                for pt in poly[1:]:
-                    emit_extrude_to(pt[0], pt[1], z_target)
+            first_idx, last_idx = mesh_layer_ranges[mesh_index]
+            offset_from_bottom = layer_index - first_idx
+            offset_from_top = last_idx - layer_index
+            is_solid = (
+                offset_from_bottom < bottom_layers
+                or offset_from_top < top_layers
+            )
+            if is_solid:
+                spacing: float | None = nozzle_width
+            elif infill_density > 0:
+                spacing = nozzle_width / infill_density
+            else:
+                spacing = None
 
-        # --- infill ---
-        is_solid = (layer_index < bottom_layers) or (layer_index >= total_layers - top_layers)
-        if is_solid:
-            spacing: float | None = nozzle_width
-        elif infill_density > 0:
-            spacing = nozzle_width / infill_density
-        else:
-            spacing = None  # no infill on this layer
-
-        if spacing is not None:
-            # Alternate scan direction per layer for strength + a more realistic look.
-            horizontal = (layer_index % 2 == 0)
+            if spacing is None:
+                continue
             infill_segments = _rectilinear_infill(polylines, spacing, horizontal=horizontal)
             for (a, b) in infill_segments:
                 moves.append(Move(kind="travel", x=a[0], y=a[1], z=z_target, e=cumulative_e))

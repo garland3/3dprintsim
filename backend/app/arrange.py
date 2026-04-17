@@ -30,11 +30,16 @@ class ArrangeError(Exception):
     pass
 
 
+# Shared with state.py's single-part centering path so both code paths agree
+# on what "fits on this bed" means.
+DEFAULT_MARGIN = 5.0
+
+
 def arrange(
     parts: list[ArrangeInput],
     bed_x: float,
     bed_y: float,
-    margin: float = 5.0,
+    margin: float = DEFAULT_MARGIN,
 ) -> list[Placement]:
     if not parts:
         return []

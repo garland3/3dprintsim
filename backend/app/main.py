@@ -145,6 +145,10 @@ def create_app() -> FastAPI:
                 bottom_layers=req.bottom_layers,
                 nozzle_width=req.nozzle_width,
             )
+        except ArrangeError as exc:
+            # slice_all() implicitly auto-arranges unplaced parts; surface bed
+            # fit failures as 409 so the UI can distinguish them from validation.
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return result.summary()

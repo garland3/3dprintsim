@@ -213,6 +213,68 @@ def test_slice_solid_top_bottom_more_than_sparse_middle(client: TestClient):
     assert min(solid_counts) > max(middle_counts)
 
 
+def test_slice_per_part_solid_layers_respect_per_part_height(client: TestClient):
+    """Short parts should get solid top layers even when printed alongside taller parts.
+
+    Slices a 4 mm cube and a 20 mm cube together with top_layers=2 / bottom_layers=2 at
+    layer_height=1 mm. The short part only has 4 layers — all 4 must be solid. Without
+    per-part accounting the short part's top window never triggered because the build's
+    total height was 20 layers.
+    """
+    upload_cube(client, size=4.0, name="short.stl")
+    upload_cube(client, size=20.0, name="tall.stl")
+    client.post(
+        "/api/slice",
+        json={"layer_height": 1.0, "perimeters": 1, "infill_density": 0.1,
+              "top_layers": 2, "bottom_layers": 2},
+    )
+    payload = client.get("/api/slice").json()
+    parts = client.get("/api/parts").json()
+    by_name = {p["name"]: p for p in parts}
+    sx, sy = by_name["short.stl"]["placement"]["x"], by_name["short.stl"]["placement"]["y"]
+    sw, sd = by_name["short.stl"]["size"][0], by_name["short.stl"]["size"][1]
+
+    def in_short_footprint(m):
+        return sx <= m["x"] <= sx + sw and sy <= m["y"] <= sy + sd
+
+    short_moves_by_z: dict[float, int] = {}
+    for m in payload["moves"]:
+        if m["kind"] == "extrude" and in_short_footprint(m):
+            z = round(m["z"], 3)
+            short_moves_by_z[z] = short_moves_by_z.get(z, 0) + 1
+    zs = sorted(short_moves_by_z)
+    # Short cube is 4 mm tall at 1 mm layers → 4 layers; all of them are inside
+    # the top OR bottom window and must therefore be solid.
+    assert len(zs) == 4, f"expected 4 layers for short part, got {zs}"
+    # Solid layers on a 4 mm square at 0.4 mm spacing produce ~10 infill lines
+    # plus 4 perimeter points per layer → ≥10 extrude moves per layer. A sparse
+    # 10% layer would have ~4 perimeter + ~1 infill = ~5, well below 10.
+    for z in zs:
+        assert short_moves_by_z[z] >= 10, (
+            f"layer at z={z} has only {short_moves_by_z[z]} moves — looks sparse"
+        )
+
+
+def test_upload_oversize_part_stays_unplaced_and_slice_returns_409(client: TestClient):
+    """Oversize single-part uploads must not bypass the bed-fit check.
+
+    The UX contract is: upload always succeeds (we want the part in the parts
+    list so the user can see it), but if it can't fit the current bed we leave
+    placement=None and the subsequent slice fails with a clear 409 instead of
+    silently producing out-of-bounds toolpaths.
+    """
+    # Shrink the bed so a 20 mm cube no longer fits the required 10 mm margin window.
+    client.post("/api/bed", json={"x": 20, "y": 20, "z": 50})
+    pid = upload_cube(client, size=20.0)
+    parts = client.get("/api/parts").json()
+    assert parts[0]["id"] == pid
+    assert parts[0]["placement"] is None, "oversize part must not be auto-placed"
+
+    r = client.post("/api/slice", json={"layer_height": 1.0})
+    assert r.status_code == 409, r.text
+    assert "does not fit" in r.json().get("detail", "")
+
+
 def test_remove_and_clear(client: TestClient):
     pid = upload_cube(client)
     client.delete(f"/api/parts/{pid}")

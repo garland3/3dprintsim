@@ -61,7 +61,20 @@ export class PrinterScene {
   dispose() {
     cancelAnimationFrame(this._raf);
     window.removeEventListener('resize', this._resize);
+    this._disposeGroup(this.toolpathGroup);
+    this._disposeGroup(this.printedGroup);
     this.renderer.dispose();
+  }
+
+  _disposeGroup(group) {
+    for (const obj of group.children) {
+      if (obj.geometry && typeof obj.geometry.dispose === 'function') {
+        obj.geometry.dispose();
+      }
+      if (obj.material && typeof obj.material.dispose === 'function') {
+        obj.material.dispose();
+      }
+    }
   }
 
   _resize = () => {
@@ -197,6 +210,11 @@ export class PrinterScene {
 
   // moves: full list from the slice endpoint (kind, x, y, z, e)
   setToolpath(moves) {
+    // Dispose GPU resources from the previous slice before clearing the
+    // Three.js groups; LineSegmentsGeometry/LineMaterial don't release their
+    // InstancedInterleavedBuffer / shader program otherwise.
+    this._disposeGroup(this.toolpathGroup);
+    this._disposeGroup(this.printedGroup);
     this.toolpathGroup.clear();
     this.printedGroup.clear();
     this._moves = moves || [];
@@ -206,7 +224,11 @@ export class PrinterScene {
       this.head.visible = false;
       this._ghostMat = null;
       this._printedMat = null;
+      this._printedGeom = null;
+      this._printedPositions = null;
+      this._printedColors = null;
       this._extrudeSegments = null;
+      this._printedVertCount = 0;
       return;
     }
 
@@ -281,10 +303,13 @@ export class PrinterScene {
     cursor = Math.max(0, Math.min(moves.length, cursor));
     const segs = this._extrudeSegments || [];
 
-    // How many extrude segments have completed by this cursor.
+    // How many extrude segments have completed by this cursor. `moveIndex` is
+    // the index of the move that *terminates* the segment; the backend's
+    // cursor is the next move to execute, so a segment is complete only once
+    // cursor has advanced strictly past it (matches the original i<cursor-1).
     let visibleSegs = 0;
     for (let i = 0; i < segs.length; i++) {
-      if (segs[i].moveIndex <= cursor) visibleSegs = i + 1;
+      if (segs[i].moveIndex < cursor) visibleSegs = i + 1;
       else break;
     }
 

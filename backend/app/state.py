@@ -96,29 +96,44 @@ class PrinterService:
         part = Part(id=part_id, name=name, mesh=mesh)
         with self._lock:
             self.parts[part_id] = part
-            # Place the new part on the bed immediately. If it's the only part,
-            # centering beats a corner drop; if there are others, re-pack all of
-            # them with auto-arrange so nothing overlaps.
+            # Place the new part on the bed immediately so it's visible without a
+            # second click. Single-part case → centered; multi-part → re-pack.
+            # If the bed can't hold the new set, leave the new part unplaced so
+            # the next slice/arrange call fails loudly rather than silently
+            # emitting an overlapping or out-of-bounds toolpath.
             if len(self.parts) == 1:
-                part.placement = self._center_placement(part)
+                try:
+                    part.placement = self._center_placement(part)
+                except ArrangeError:
+                    part.placement = None
             else:
                 try:
                     self._auto_arrange_locked()
                 except ArrangeError:
-                    # Bed too small to fit everything — fall back to centering
-                    # just the new part; user can fix bed size and re-arrange.
-                    part.placement = self._center_placement(part)
+                    part.placement = None
             self._invalidate_slice()
         return part
 
     def _center_placement(self, part: Part) -> Placement:
+        """Return a centered Placement if the part fits, else raise ArrangeError.
+
+        Uses the same margin rule `arrange()` uses so single-part and multi-part
+        uploads agree on what "fits on this bed" means.
+        """
+        from .arrange import DEFAULT_MARGIN
+
         mn = part.mesh.min_xyz
         mx = part.mesh.max_xyz
         w = mx[0] - mn[0]
         d = mx[1] - mn[1]
         bx, by, _ = self.bed_size
-        x = max(0.0, (bx - w) / 2)
-        y = max(0.0, (by - d) / 2)
+        if w + 2 * DEFAULT_MARGIN > bx or d + 2 * DEFAULT_MARGIN > by:
+            raise ArrangeError(
+                f"part {part.id} ({w:.1f}x{d:.1f}) does not fit on "
+                f"{bx:.0f}x{by:.0f} bed"
+            )
+        x = (bx - w) / 2
+        y = (by - d) / 2
         return Placement(part_id=part.id, x=x, y=y, rotation_deg=0.0)
 
     def add_part_from_base64(self, name: str, b64: str) -> Part:
