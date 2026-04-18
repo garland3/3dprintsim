@@ -1,7 +1,8 @@
 # Multi-stage build on RHEL 9 (Red Hat Universal Base Image 9).
 #   stage 1: build the Vite bundle with Node.js
 #   stage 2: install the Python backend and copy the built frontend in
-# The final image runs both services on ports 8000 (API+MCP) and 5173 (UI).
+# The final image runs a single FastAPI process that serves both the API
+# (and MCP at /mcp) and the static frontend bundle from one port.
 
 ARG UBI_VERSION=9.4
 # Pin uv so resolver/CLI changes in a future release can't silently break the
@@ -27,17 +28,16 @@ FROM registry.access.redhat.com/ubi9/ubi:${UBI_VERSION} AS runtime
 # a stage (Docker scoping rule).
 ARG UV_VERSION
 
-# Python 3.11 + uv for dependency management, plus Node (used only to serve the
-# built frontend via vite preview). dnf clean keeps the layer small.
+# Python 3.11 + uv for dependency management. No Node at runtime — FastAPI
+# serves the prebuilt static bundle directly, so we only ship one process.
 RUN dnf install -y --setopt=install_weak_deps=False \
         python3.11 python3.11-pip \
-        nodejs npm \
         shadow-utils \
     && dnf clean all \
     && rm -rf /var/cache/dnf \
     && python3.11 -m pip install --no-cache-dir "uv==${UV_VERSION}"
 
-# Create an unprivileged user to run the services.
+# Create an unprivileged user to run the service.
 RUN useradd --system --create-home --uid 1001 printsim
 
 WORKDIR /app
@@ -54,13 +54,9 @@ RUN uv sync --frozen --no-install-project
 
 COPY backend/ /app/backend/
 
-# Pull in the built Vite bundle plus the config needed to serve it.
+# Pull in the built Vite bundle. FastAPI mounts this dir at / so the UI is
+# served from the same port as /api and /mcp.
 COPY --from=frontend-build /build/frontend/dist /app/frontend/dist
-COPY frontend/package.json /app/frontend/package.json
-COPY frontend/vite.config.js /app/frontend/vite.config.js
-# `vite preview` needs vite installed; install prod-only in a tiny node layer.
-WORKDIR /app/frontend
-RUN npm install --omit=dev --silent
 
 WORKDIR /app
 COPY docs/ /app/docs/
@@ -72,12 +68,11 @@ USER printsim
 ENV PYTHONUNBUFFERED=1 \
     HOST=0.0.0.0 \
     BACKEND_PORT=8000 \
-    FRONTEND_PORT=5173 \
+    FRONTEND_DIST=/app/frontend/dist \
     PATH=/app/backend/.venv/bin:$PATH
 
-EXPOSE 8000 5173
+EXPOSE 8000
 
-# Start both services; if either exits the container exits.
 COPY --chown=printsim:printsim docker/entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 

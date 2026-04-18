@@ -17,16 +17,21 @@ from __future__ import annotations
 import contextlib
 import os
 from dataclasses import asdict
+from pathlib import Path
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse, Response
+from fastapi.responses import FileResponse, PlainTextResponse, Response
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from .arrange import ArrangeError
+from .env import load_dotenv
 from .mcp_server import build_mcp
 from .state import DEFAULT_SESSION_ID, PrinterService, get_service, reset_service
+
+load_dotenv()
 
 
 class BedSize(BaseModel):
@@ -146,6 +151,68 @@ class IframeEmbedMiddleware(BaseHTTPMiddleware):
         return response
 
 
+def _resolve_frontend_dist() -> Path | None:
+    """Find the built Vite bundle, if any.
+
+    Checked locations (first hit wins):
+      1. `FRONTEND_DIST` env var (explicit override for deployments)
+      2. `/app/frontend/dist` (where the podman image drops it)
+      3. `<repo>/frontend/dist` (local `npm run build` output)
+
+    Returns None when no bundle is present — backend runs fine without it,
+    which is the normal case during local development (Vite serves the UI).
+    """
+    override = os.getenv("FRONTEND_DIST")
+    if override:
+        p = Path(override)
+        return p if p.is_dir() else None
+
+    container_path = Path("/app/frontend/dist")
+    if container_path.is_dir():
+        return container_path
+
+    repo_dist = Path(__file__).resolve().parents[2] / "frontend" / "dist"
+    if repo_dist.is_dir():
+        return repo_dist
+    return None
+
+
+def _mount_frontend(app: FastAPI) -> None:
+    """Serve the built frontend from the same ASGI app when available.
+
+    Mounted *after* `/api` and `/mcp` are registered so API routes always
+    win. The SPA fallback re-serves `index.html` for unknown paths so
+    client-side routing (should we ever add any) doesn't 404.
+    """
+    dist = _resolve_frontend_dist()
+    if dist is None:
+        return
+
+    index_html = dist / "index.html"
+    assets_dir = dist / "assets"
+    if assets_dir.is_dir():
+        app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
+
+    @app.get("/", include_in_schema=False)
+    def _index() -> FileResponse:
+        return FileResponse(index_html)
+
+    @app.get("/{path:path}", include_in_schema=False)
+    def _spa_fallback(path: str) -> FileResponse:
+        # Don't swallow API/MCP — those paths are registered earlier and
+        # take precedence, but guard anyway in case of route ordering churn.
+        if path.startswith(("api/", "mcp/")) or path in {"api", "mcp"}:
+            raise HTTPException(status_code=404)
+        candidate = (dist / path).resolve()
+        try:
+            candidate.relative_to(dist.resolve())
+        except ValueError:
+            raise HTTPException(status_code=404) from None
+        if candidate.is_file():
+            return FileResponse(candidate)
+        return FileResponse(index_html)
+
+
 def create_app() -> FastAPI:
     mcp = build_mcp()
     mcp_app = mcp.http_app(path="/")
@@ -183,6 +250,8 @@ def create_app() -> FastAPI:
     @app.get("/api/health")
     def health() -> dict:
         return {"ok": True, "service": "3dprintsim"}
+
+    _mount_frontend(app)
 
     @app.get("/api/session")
     def session_info(request: Request, session: str | None = Query(default=None)) -> dict:
