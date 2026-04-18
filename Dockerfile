@@ -5,12 +5,15 @@
 # (and MCP at /mcp) and the static frontend bundle from one port.
 
 ARG UBI_VERSION=9.4
+# UBI application stream images (nodejs-20, etc.) tag by stream major, not RHEL
+# minor — keep this separate from UBI_VERSION.
+ARG UBI_NODEJS_TAG=1
 # Pin uv so resolver/CLI changes in a future release can't silently break the
 # backend install step; bump deliberately when rolling the lockfile.
 ARG UV_VERSION=0.8.17
 
 # ─── Stage 1 — build the React/Vite frontend ──────────────────────────────────
-FROM registry.access.redhat.com/ubi9/nodejs-20:${UBI_VERSION} AS frontend-build
+FROM registry.access.redhat.com/ubi9/nodejs-20:${UBI_NODEJS_TAG} AS frontend-build
 
 USER 0
 WORKDIR /build/frontend
