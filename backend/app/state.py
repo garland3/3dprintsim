@@ -1,13 +1,20 @@
-"""Shared in-memory printer state plus a façade for operations.
+"""In-memory printer state plus a façade for operations.
 
-Both the HTTP API and the MCP server talk to the same PrinterService singleton
-so an AI agent and a human share one virtual printer.
+Each MCP session (and each browser tab) gets its own PrinterService via the
+SessionRegistry, so an AI agent and the user's UI in the SAME session share a
+single virtual printer, while different users never see each other's parts.
+
+For tests and dev calls without a session id, a sentinel "default" session is
+used — that keeps the pre-multiuser code paths working.
 """
 
 from __future__ import annotations
 
 import base64
+import os
+import re
 import threading
+import time
 import uuid
 from dataclasses import asdict, dataclass, field
 
@@ -368,26 +375,176 @@ class PrinterService:
         self.simulation = Simulation(running=False, cursor=0, speed=self.simulation.speed)
 
 
-_service: PrinterService | None = None
+DEFAULT_SESSION_ID = "default"
+
+# Session ids land in dict keys, so we lock the charset down to keep an
+# attacker from filling the registry with NULs, control chars, very long
+# strings, or other weirdness. The format is wide enough for a UUID, an MCP
+# session token, the literal "default" sentinel, or an Atlas conversation id.
+_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9._\-:]{1,128}$")
 
 
-def get_service() -> PrinterService:
-    global _service
-    if _service is None:
-        _service = PrinterService()
-    return _service
+def _validate_session_id(sid: str) -> str:
+    if not _SESSION_ID_RE.match(sid):
+        raise ValueError(
+            f"invalid session id (must match {_SESSION_ID_RE.pattern})"
+        )
+    return sid
 
 
-def reset_service() -> None:
-    """Test hook."""
-    global _service
-    _service = PrinterService()
+class SessionRegistry:
+    """Per-session PrinterService store with lazy creation + idle TTL cleanup.
+
+    Every MCP session (one per chat conversation per user, keyed on the
+    `mcp-session-id` header FastMCP's streamable-HTTP transport mints) and
+    every browser tab (keyed on the `X-Session-Id` header the frontend sends)
+    gets its own printer. Sessions idle for longer than `ttl_seconds` are
+    evicted when any other session touches the registry, so a long-running
+    server doesn't accumulate state from closed browser tabs.
+
+    Because the session id is user-controlled (HTTP header / query param), we
+    also enforce a hard cap on the number of concurrently live sessions and a
+    charset whitelist on the id itself — together that prevents a hostile
+    client from spinning up unbounded PrinterServices to OOM the process.
+    """
+
+    def __init__(
+        self,
+        ttl_seconds: float = 3600.0,
+        max_sessions: int = 1000,
+    ) -> None:
+        self._lock = threading.RLock()
+        self._services: dict[str, PrinterService] = {}
+        self._last_seen: dict[str, float] = {}
+        self.ttl_seconds = ttl_seconds
+        self.max_sessions = max_sessions
+
+    def get(self, session_id: str | None) -> PrinterService:
+        """Return (and create-on-miss) the PrinterService for `session_id`.
+
+        Raises ValueError on a malformed session id or when the live-session
+        cap would be exceeded by a fresh allocation.
+        """
+        sid = _validate_session_id(session_id or DEFAULT_SESSION_ID)
+        now = time.monotonic()
+        with self._lock:
+            self._evict_idle_locked(now)
+            svc = self._services.get(sid)
+            if svc is None:
+                if len(self._services) >= self.max_sessions:
+                    # Already pruned idle sessions above; if we're still at the
+                    # cap, the live session count is genuinely too high. Refuse
+                    # rather than silently evicting a live user's state.
+                    raise ValueError(
+                        f"session cap reached ({self.max_sessions}); "
+                        "refusing to allocate a new PrinterService"
+                    )
+                svc = PrinterService()
+                self._services[sid] = svc
+            self._last_seen[sid] = now
+            return svc
+
+    def drop(self, session_id: str) -> None:
+        """Explicit eviction — used by `reset_service(session_id)`."""
+        with self._lock:
+            self._services.pop(session_id, None)
+            self._last_seen.pop(session_id, None)
+
+    def reset(self) -> None:
+        """Wipe the entire registry. Used by tests and the global `/api/reset`."""
+        with self._lock:
+            self._services.clear()
+            self._last_seen.clear()
+
+    def _evict_idle_locked(self, now: float) -> None:
+        if self.ttl_seconds <= 0:
+            return
+        cutoff = now - self.ttl_seconds
+        stale = [sid for sid, ts in self._last_seen.items() if ts < cutoff]
+        for sid in stale:
+            self._services.pop(sid, None)
+            self._last_seen.pop(sid, None)
+
+    def active_sessions(self) -> list[str]:
+        with self._lock:
+            return list(self._services.keys())
+
+
+def _env_float(name: str, default: float) -> float:
+    """Parse a float-valued env var without crashing the import on garbage.
+
+    A misconfigured `SESSION_TTL_SECONDS=forever` shouldn't take the whole
+    service down — fall back to the default and let the operator notice via
+    the warning.
+    """
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        import logging
+        logging.getLogger(__name__).warning(
+            "ignoring %s=%r (not a float); falling back to %s",
+            name,
+            raw,
+            default,
+        )
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        import logging
+        logging.getLogger(__name__).warning(
+            "ignoring %s=%r (not an int); falling back to %s",
+            name,
+            raw,
+            default,
+        )
+        return default
+
+
+_registry: SessionRegistry = SessionRegistry(
+    ttl_seconds=_env_float("SESSION_TTL_SECONDS", 3600.0),
+    max_sessions=_env_int("SESSION_MAX_COUNT", 1000),
+)
+
+
+def get_registry() -> SessionRegistry:
+    return _registry
+
+
+def get_service(session_id: str | None = None) -> PrinterService:
+    """Return the PrinterService bound to `session_id`.
+
+    Called with no argument it returns the "default" session's service, which
+    matches the pre-multiuser behaviour — handy for dev clients, tests, and
+    any non-session-aware HTTP call.
+    """
+    return _registry.get(session_id)
+
+
+def reset_service(session_id: str | None = None) -> None:
+    """Test hook. Without args, wipes every session's state."""
+    if session_id is None:
+        _registry.reset()
+    else:
+        _registry.drop(session_id)
 
 
 __all__ = [
     "ArrangeError",
+    "DEFAULT_SESSION_ID",
     "PrinterService",
     "Part",
+    "SessionRegistry",
+    "get_registry",
     "get_service",
     "reset_service",
 ]

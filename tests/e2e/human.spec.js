@@ -2,6 +2,7 @@
 import { test, expect } from '@playwright/test';
 import { fileURLToPath } from 'url';
 import path from 'path';
+import { apiGetJSON } from './_session.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const CUBE = path.resolve(here, '../fixtures/cube20.stl');
@@ -42,8 +43,9 @@ test('multiple uploads auto-arrange without overlap', async ({ page, request }) 
     await page.getByTestId('file-input').setInputFiles(CUBE);
     await expect(page.getByTestId('parts-list').locator('li')).toHaveCount(i + 1, { timeout: 15_000 });
   }
-  // confirm the backend placed them all within the bed
-  const state = await (await request.get('http://127.0.0.1:8000/api/state')).json();
+  // confirm the backend placed them all within the bed — must read the
+  // same session the browser is writing to, not the default one.
+  const state = await apiGetJSON(page, request, '/api/state');
   const placed = state.parts.filter((p) => p.placement);
   expect(placed.length).toBe(3);
   for (const p of placed) {

@@ -422,6 +422,7 @@ def test_mcp_tools_exposed():
         "get_simulation_frame",
         "set_part_scale",
         "focus_viewer",
+        "open_viewer",
     }
     assert expected <= names
 

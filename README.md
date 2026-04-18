@@ -6,11 +6,14 @@ Virtual FDM printer simulator. Upload STLs, auto-arrange on the bed, slice into
 perimeters + infill + solid top/bottom layers, and watch the simulated print
 head build each layer as thick, glowing filament.
 
-Two ways to drive it:
+Three ways to drive it:
 
 - **Humans**: React + Three.js UI at `http://localhost:5173`.
-- **AI agents**: Model Context Protocol server exposed over the same FastAPI
-  backend at `http://localhost:8000/mcp` via `fastmcp`.
+- **AI agents**: stateful Model Context Protocol server (fastmcp 3.2+) at
+  `http://localhost:8000/mcp`. Each conversation gets its own virtual printer.
+- **Atlas UI**: the `open_viewer` MCP tool returns a canvas iframe envelope
+  so Sandia's [Atlas UI 3](https://github.com/sandialabs/atlas-ui-3) shows the
+  live 3D view next to the chat. See [`docs/mcp.md`](docs/mcp.md#live-viewer-in-atlas-iframe).
 
 ## Features
 
@@ -75,6 +78,8 @@ Served at `/mcp`. See `backend/app/mcp_server.py` for definitions.
 - `start_simulation`
 - `step_simulation(steps)`
 - `get_simulation_frame`
+- `open_viewer(title?)` — opens the live 3D canvas in Atlas via the v2
+  `display.type = "iframe"` envelope.
 
 ## Testing
 
