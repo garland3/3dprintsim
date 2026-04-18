@@ -17,16 +17,21 @@ from __future__ import annotations
 import contextlib
 import os
 from dataclasses import asdict
+from pathlib import Path
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse, Response
+from fastapi.responses import FileResponse, PlainTextResponse, Response
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from .arrange import ArrangeError
+from .env import load_dotenv
 from .mcp_server import build_mcp
 from .state import DEFAULT_SESSION_ID, PrinterService, get_service, reset_service
+
+load_dotenv()
 
 
 class BedSize(BaseModel):
@@ -144,6 +149,82 @@ class IframeEmbedMiddleware(BaseHTTPMiddleware):
         if "x-frame-options" in response.headers:
             del response.headers["x-frame-options"]
         return response
+
+
+def _resolve_frontend_dist() -> Path | None:
+    """Find the built Vite bundle, if any.
+
+    Checked locations (first hit wins):
+      1. `FRONTEND_DIST` env var (explicit override for deployments)
+      2. `/app/frontend/dist` (where the podman image drops it)
+      3. `<repo>/frontend/dist` (local `npm run build` output)
+
+    Returns None when no bundle is present — backend runs fine without it,
+    which is the normal case during local development (Vite serves the UI).
+    """
+    override = os.getenv("FRONTEND_DIST")
+    if override:
+        p = Path(override)
+        return p if p.is_dir() else None
+
+    container_path = Path("/app/frontend/dist")
+    if container_path.is_dir():
+        return container_path
+
+    repo_dist = Path(__file__).resolve().parents[2] / "frontend" / "dist"
+    if repo_dist.is_dir():
+        return repo_dist
+    return None
+
+
+def _mount_frontend(app: FastAPI) -> None:
+    """Serve the built frontend from the same ASGI app when available.
+
+    Mounted *after* `/api` and `/mcp` are registered so API routes always
+    win. The SPA fallback re-serves `index.html` for unknown paths so
+    client-side routing (should we ever add any) doesn't 404.
+    """
+    dist = _resolve_frontend_dist()
+    if dist is None:
+        return
+
+    index_html = dist / "index.html"
+    if not index_html.is_file():
+        # Incomplete dist (partial copy, wrong FRONTEND_DIST, pre-build race).
+        # Skip the mount loudly instead of 500-ing on every pageload later.
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "frontend dist %s has no index.html; skipping SPA mount", dist
+        )
+        return
+
+    assets_dir = dist / "assets"
+    if assets_dir.is_dir():
+        app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
+
+    @app.get("/", include_in_schema=False)
+    def _index() -> FileResponse:
+        return FileResponse(index_html)
+
+    # Catch-all must stay last in route-registration order. Starlette matches
+    # routes top-down, so `/api/*` handlers (registered earlier in create_app)
+    # win over this fallback. `_mount_frontend` itself is called right before
+    # `return app` to preserve that invariant.
+    @app.get("/{path:path}", include_in_schema=False)
+    def _spa_fallback(path: str) -> FileResponse:
+        # Belt-and-braces guard — if a future refactor moves this registration
+        # earlier, we still refuse to shadow the API surface.
+        if path.startswith(("api/", "mcp/")) or path in {"api", "mcp"}:
+            raise HTTPException(status_code=404)
+        candidate = (dist / path).resolve()
+        try:
+            candidate.relative_to(dist.resolve())
+        except ValueError:
+            raise HTTPException(status_code=404) from None
+        if candidate.is_file():
+            return FileResponse(candidate)
+        return FileResponse(index_html)
 
 
 def create_app() -> FastAPI:
@@ -378,6 +459,10 @@ def create_app() -> FastAPI:
     @app.post("/api/viewer/focus")
     def request_focus(svc: PrinterService = Depends(session_service)) -> dict:
         return {"focus_request": svc.request_focus()}
+
+    # Register SPA routes last so the `/{path:path}` catch-all can't preempt
+    # any `/api/*` handler above. See `_mount_frontend` for detail.
+    _mount_frontend(app)
 
     return app
 

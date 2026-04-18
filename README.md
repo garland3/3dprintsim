@@ -33,18 +33,30 @@ Three ways to drive it:
 ## Quickstart
 
 ```bash
+# One-time: copy the example env file so backend and frontend share ports.
+cp .env.example .env
+
 # Backend (uses uv — https://docs.astral.sh/uv/)
 cd backend
 uv sync
-uv run uvicorn app.main:app --reload --port 8000
+set -a && source ../.env && set +a
+uv run uvicorn app.main:app --reload --port "${BACKEND_PORT}"
 
-# Frontend (separate terminal)
+# Frontend (separate terminal — Vite reads ../.env automatically)
 cd frontend
 npm install
 npm run dev
 
-# Open http://localhost:5173
+# Open http://localhost:5173 (or whatever FRONTEND_PORT you set).
 ```
+
+Both ports are driven by the repo-root `.env`:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `HOST` | `0.0.0.0` | Bind host for the backend (and Vite in dev). |
+| `BACKEND_PORT` | `8000` | FastAPI + MCP port. |
+| `FRONTEND_PORT` | `5173` | Vite dev-server port (dev only — the container doesn't run Vite). |
 
 ## Architecture
 
@@ -91,15 +103,19 @@ cd backend && uv run pytest
 cd tests && npm install && npx playwright test
 ```
 
-## Docker
+## Podman
 
-A RHEL 9 (UBI 9) image builds both services into one container:
+A RHEL 9 (UBI 9) image builds the backend and the prebuilt frontend into
+one container that serves everything from a single port:
 
 ```bash
-docker build -t 3dprintsim .
-docker run --rm -p 8000:8000 -p 5173:5173 3dprintsim
+podman build -t 3dprintsim .
+podman run --rm --env-file .env -p 8000:8000 3dprintsim
 ```
 
+Then open `http://localhost:8000` — UI, `/api`, and `/mcp/` are all on the
+same port. To run on a different port, pass both the publish spec and the
+env override: `podman run --rm -e BACKEND_PORT=9000 -p 9000:9000 3dprintsim`.
 See [`docs/docker.md`](docs/docker.md) for details.
 
 ## Documentation
