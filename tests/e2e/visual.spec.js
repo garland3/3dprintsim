@@ -9,6 +9,7 @@
 import { test, expect } from '@playwright/test';
 import { fileURLToPath } from 'url';
 import path from 'path';
+import { apiGetJSON } from './_session.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const CUBE_SMALL = path.resolve(here, '../fixtures/cube10.stl');
@@ -71,7 +72,7 @@ test('overhang part reports support cells and solid fill', async ({ page, reques
   await expect(page.getByTestId('slice-summary')).toBeVisible();
 
   // Read the slice summary through the backend to get support_cell_count.
-  const st = await (await request.get('http://127.0.0.1:8000/api/state')).json();
+  const st = await apiGetJSON(page, request, '/api/state');
   expect(st.slice.support_cell_count).toBeGreaterThan(0);
 
   // The legend should be present and mention supports.
@@ -80,7 +81,7 @@ test('overhang part reports support cells and solid fill', async ({ page, reques
   await expect(legend).toContainText(/supports/);
 
   // Check the moves payload includes a "support" role somewhere.
-  const slicePayload = await (await request.get('http://127.0.0.1:8000/api/slice')).json();
+  const slicePayload = await apiGetJSON(page, request, '/api/slice');
   expect(slicePayload.ready).toBe(true);
   const roles = new Set(slicePayload.moves.map((m) => m.role).filter(Boolean));
   expect(roles.has('support')).toBe(true);
@@ -96,7 +97,7 @@ test('support density of 0 suppresses support moves', async ({ page, request }) 
   await page.getByTestId('slice').click();
   await expect(page.getByTestId('slice-summary')).toBeVisible();
 
-  const slicePayload = await (await request.get('http://127.0.0.1:8000/api/slice')).json();
+  const slicePayload = await apiGetJSON(page, request, '/api/slice');
   const hasSupport = slicePayload.moves.some((m) => m.role === 'support');
   expect(hasSupport).toBe(false);
 });

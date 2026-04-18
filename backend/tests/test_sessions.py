@@ -183,6 +183,27 @@ def test_mcp_open_viewer_url_obeys_viewer_public_url(monkeypatch):
     assert data["display"]["url"].startswith("https://sim.example.com/?embed=1&session=")
 
 
+def test_mcp_session_id_helper_honors_x_session_id_header(monkeypatch):
+    """The MCP session resolver must prefer an explicit X-Session-Id header
+    over ctx.session_id. That's what lets Atlas (and our e2e harness) bind
+    one MCP call to the same PrinterService a browser iframe is touching."""
+    from app import mcp_server
+
+    class StubCtx:
+        session_id = "mcp-auto-minted-id"
+
+    monkeypatch.setattr(
+        mcp_server,
+        "get_http_headers",
+        lambda *a, **kw: {"x-session-id": "explicit-browser-id"},
+    )
+    assert mcp_server._session_id(StubCtx()) == "explicit-browser-id"
+
+    # With no header, it falls back to ctx.session_id.
+    monkeypatch.setattr(mcp_server, "get_http_headers", lambda *a, **kw: {})
+    assert mcp_server._session_id(StubCtx()) == "mcp-auto-minted-id"
+
+
 def test_mcp_tool_calls_without_ctx_use_default_session():
     """In-process MCP calls (tests, stdio clients, dev harnesses) have no MCP
     handshake yet — ctx.session_id raises — so every tool must fall back to

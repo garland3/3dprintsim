@@ -26,7 +26,16 @@ function runAgent(script, env = {}) {
   return res.stdout.trim();
 }
 
+// Shared session id for the agent's MCP client and the UI-style REST call —
+// this is the same trick Atlas uses (the `open_viewer` tool hands the agent's
+// session id to the iframe, which echoes it back as `X-Session-Id` on every
+// REST call). Fresh per run so tests don't collide across retries.
+const E2E_SESSION = `e2e-${Date.now().toString(36)}`;
+const E2E_HEADERS = { 'X-Session-Id': E2E_SESSION };
+
 test.beforeEach(async ({ request }) => {
+  // No X-Session-Id here — the bare /api/reset wipes every session so stale
+  // state from a previous run can't leak into this one.
   await request.post('http://127.0.0.1:8000/api/reset');
 });
 
@@ -34,9 +43,16 @@ test('AI agent can drive the full pipeline via MCP tools', async ({ request }) =
   const script = `
 import asyncio, json, os
 from fastmcp import Client
+from fastmcp.client.transports import StreamableHttpTransport
 
 async def main():
-    async with Client("http://127.0.0.1:8000/mcp/") as c:
+    # X-Session-Id pins every tool call to the shared test session so the
+    # REST assertion below sees the same PrinterService the agent drove.
+    transport = StreamableHttpTransport(
+        "http://127.0.0.1:8000/mcp/",
+        headers={"X-Session-Id": os.environ["E2E_SESSION"]},
+    )
+    async with Client(transport) as c:
         tools = [t.name for t in await c.list_tools()]
         assert "upload_stl" in tools, tools
 
@@ -60,17 +76,27 @@ async def main():
 
 asyncio.run(main())
   `;
-  const out = runAgent(script, { CUBE_B64 });
+  const out = runAgent(script, { CUBE_B64, E2E_SESSION });
   const parsed = JSON.parse(out);
   expect(parsed.cursor).toBeGreaterThan(0);
   expect(parsed.total).toBeGreaterThan(0);
   expect(parsed.head).toBe(true);
 
-  // The same printer is visible to the HTTP API.
-  const state = await (await request.get('http://127.0.0.1:8000/api/state')).json();
+  // The same printer is visible to the HTTP API when the REST call reuses
+  // the agent's session id — this is the Atlas contract.
+  const state = await (
+    await request.get('http://127.0.0.1:8000/api/state', { headers: E2E_HEADERS })
+  ).json();
   expect(state.bed_size).toEqual([220, 220, 210]);
   expect(state.parts.length).toBe(1);
   expect(state.slice).not.toBeNull();
+
+  // And a REST call with no session header lands in a DIFFERENT (default)
+  // PrinterService — proves isolation is real, not accidental.
+  const isolated = await (
+    await request.get('http://127.0.0.1:8000/api/state')
+  ).json();
+  expect(isolated.parts.length).toBe(0);
 });
 
 test('MCP tools include the full pipeline surface', async ({}) => {

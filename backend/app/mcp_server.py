@@ -22,6 +22,7 @@ from urllib.parse import urljoin, urlparse
 
 import httpx
 from fastmcp import Context, FastMCP
+from fastmcp.server.dependencies import get_http_headers
 
 from .state import DEFAULT_SESSION_ID, PrinterService, get_service
 
@@ -137,13 +138,29 @@ def _atlas_display_name(url: str, fallback: str = "atlas.stl") -> str:
 
 
 def _session_id(ctx: Context | None) -> str:
-    """Resolve the active MCP session id, falling back to the shared default.
+    """Resolve the active session id for this tool invocation.
 
-    ctx.session_id raises if the handshake hasn't completed (e.g. during
-    middleware) and is simply absent when tools are called in-process (tests,
-    agent harnesses). Either way we fall back to DEFAULT_SESSION_ID so the
-    tool still does the right thing for single-user dev setups.
+    Lookup order (first match wins):
+      1. `X-Session-Id` HTTP request header — lets a client (Atlas, the e2e
+         harness, a curl-based MCP caller) bind the MCP call to the *same*
+         session id the browser iframe uses for its REST calls. This is the
+         mechanism `open_viewer` relies on: the tool returns a URL carrying
+         `?session=<mcp_session_id>` and the frontend echoes it back on
+         every REST call, so tools and UI end up in the same PrinterService.
+      2. `ctx.session_id` — FastMCP's auto-minted streamable-HTTP session id.
+         Always available once the MCP handshake completes.
+      3. `DEFAULT_SESSION_ID` — in-process tool calls (tests, stdio clients)
+         have no HTTP transport, so both of the above are unavailable.
+
+    Never raises; falls through on any error.
     """
+    try:
+        headers = get_http_headers()
+    except Exception:
+        headers = {}
+    explicit = headers.get("x-session-id") if headers else None
+    if explicit:
+        return explicit
     if ctx is None:
         return DEFAULT_SESSION_ID
     try:
