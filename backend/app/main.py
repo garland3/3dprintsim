@@ -189,6 +189,16 @@ def _mount_frontend(app: FastAPI) -> None:
         return
 
     index_html = dist / "index.html"
+    if not index_html.is_file():
+        # Incomplete dist (partial copy, wrong FRONTEND_DIST, pre-build race).
+        # Skip the mount loudly instead of 500-ing on every pageload later.
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "frontend dist %s has no index.html; skipping SPA mount", dist
+        )
+        return
+
     assets_dir = dist / "assets"
     if assets_dir.is_dir():
         app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
@@ -197,10 +207,14 @@ def _mount_frontend(app: FastAPI) -> None:
     def _index() -> FileResponse:
         return FileResponse(index_html)
 
+    # Catch-all must stay last in route-registration order. Starlette matches
+    # routes top-down, so `/api/*` handlers (registered earlier in create_app)
+    # win over this fallback. `_mount_frontend` itself is called right before
+    # `return app` to preserve that invariant.
     @app.get("/{path:path}", include_in_schema=False)
     def _spa_fallback(path: str) -> FileResponse:
-        # Don't swallow API/MCP — those paths are registered earlier and
-        # take precedence, but guard anyway in case of route ordering churn.
+        # Belt-and-braces guard — if a future refactor moves this registration
+        # earlier, we still refuse to shadow the API surface.
         if path.startswith(("api/", "mcp/")) or path in {"api", "mcp"}:
             raise HTTPException(status_code=404)
         candidate = (dist / path).resolve()
@@ -250,8 +264,6 @@ def create_app() -> FastAPI:
     @app.get("/api/health")
     def health() -> dict:
         return {"ok": True, "service": "3dprintsim"}
-
-    _mount_frontend(app)
 
     @app.get("/api/session")
     def session_info(request: Request, session: str | None = Query(default=None)) -> dict:
@@ -447,6 +459,10 @@ def create_app() -> FastAPI:
     @app.post("/api/viewer/focus")
     def request_focus(svc: PrinterService = Depends(session_service)) -> dict:
         return {"focus_request": svc.request_focus()}
+
+    # Register SPA routes last so the `/{path:path}` catch-all can't preempt
+    # any `/api/*` handler above. See `_mount_frontend` for detail.
+    _mount_frontend(app)
 
     return app
 

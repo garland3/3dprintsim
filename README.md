@@ -110,11 +110,13 @@ one container that serves everything from a single port:
 
 ```bash
 podman build -t 3dprintsim .
-podman run --rm --env-file .env -p "${BACKEND_PORT:-8000}:${BACKEND_PORT:-8000}" 3dprintsim
+podman run --rm --env-file .env -p 8000:8000 3dprintsim
 ```
 
-Then open `http://localhost:${BACKEND_PORT}` — UI, `/api`, and `/mcp/` are
-all on the same port. See [`docs/docker.md`](docs/docker.md) for details.
+Then open `http://localhost:8000` — UI, `/api`, and `/mcp/` are all on the
+same port. To run on a different port, pass both the publish spec and the
+env override: `podman run --rm -e BACKEND_PORT=9000 -p 9000:9000 3dprintsim`.
+See [`docs/docker.md`](docs/docker.md) for details.
 
 ## Documentation
 

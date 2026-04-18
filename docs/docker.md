@@ -46,25 +46,34 @@ does not require a Red Hat subscription.
 ## Run
 
 ```bash
-# Uses the ports from your repo-root .env (copy .env.example if you
-# haven't yet). Only BACKEND_PORT is published — the frontend shares it.
+# Default port (8000). Only one port is published — the frontend is served
+# from the same process as /api and /mcp.
 podman run --rm -it \
   --env-file .env \
-  -p "${BACKEND_PORT:-8000}:${BACKEND_PORT:-8000}" \
+  -p 8000:8000 \
   --name 3dprintsim \
   3dprintsim
 ```
 
-Then, on `http://localhost:${BACKEND_PORT}`:
+Then, on `http://localhost:8000`:
 
 - UI: `/`
 - HTTP API: `/api/...`
 - MCP (streamable HTTP): `/mcp/`
 
-If you want to pick a port ad-hoc without touching `.env`:
+The `-p HOST:CONTAINER` flag is evaluated by your shell, *not* from
+`--env-file`. To run on a non-default port you need to set both the
+publish spec and the container-side env:
 
 ```bash
-podman run --rm -p 9000:9000 -e BACKEND_PORT=9000 3dprintsim
+podman run --rm -e BACKEND_PORT=9000 -p 9000:9000 3dprintsim
+```
+
+Or source the `.env` into your shell first and keep a single source of truth:
+
+```bash
+set -a && source .env && set +a
+podman run --rm --env-file .env -p "${BACKEND_PORT}:${BACKEND_PORT}" 3dprintsim
 ```
 
 ## Environment variables
