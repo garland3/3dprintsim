@@ -61,9 +61,15 @@ class PartScaleRequest(BaseModel):
     scale: float = Field(gt=0)
 
 
-def _session_id(request: Request, session: str | None = Query(default=None)) -> str:
+def _session_id(request: Request, session: str | None = None) -> str:
     """Resolve the caller's session id from header-then-query, defaulting to
     the shared "default" session when neither is provided.
+
+    `session` is a plain default — FastAPI's `Query(...)` lives only on the
+    route/dependency parameters that the framework injects (see
+    `session_service` and the explicit endpoints below). Inlining `Query` here
+    would mean a manual call like `_session_id(request)` returns a
+    `fastapi.Query` instance instead of a string.
     """
     header = request.headers.get("x-session-id")
     if header:
@@ -77,17 +83,28 @@ def session_service(
     request: Request,
     session: str | None = Query(default=None),
 ) -> PrinterService:
-    """FastAPI dependency — returns the PrinterService for the caller's session."""
-    return get_service(_session_id(request, session))
+    """FastAPI dependency — returns the PrinterService for the caller's session.
+
+    A malformed session id (or one that would push us past the registry's
+    max-session cap) surfaces as a 400 instead of bubbling up as a 500.
+    """
+    try:
+        return get_service(_session_id(request, session))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 class IframeEmbedMiddleware(BaseHTTPMiddleware):
     """Allow the frontend to be rendered inside Atlas's canvas iframe.
 
     FastAPI doesn't set X-Frame-Options by default, but many reverse-proxies
-    upstream of it do. We explicitly set a permissive `Content-Security-Policy:
-    frame-ancestors` (and strip `X-Frame-Options` if anything upstream added it)
-    so any Atlas deployment — or the user's own same-origin SPA — can embed us.
+    upstream of it do. We set `Content-Security-Policy: frame-ancestors ...`
+    so Atlas (or any same-origin SPA) can embed us, and strip
+    `X-Frame-Options` so its DENY default doesn't veto the CSP.
+
+    Existing CSP directives set by upstream middleware/proxies are preserved
+    — we only replace the `frame-ancestors` directive — so this middleware
+    can't accidentally weaken a stricter policy set elsewhere.
 
     `FRAME_ANCESTORS` lets operators lock this down further without code
     changes; the default (`*`) is fine for a dev-focused simulator.
@@ -97,10 +114,30 @@ class IframeEmbedMiddleware(BaseHTTPMiddleware):
         super().__init__(app)
         self.frame_ancestors = frame_ancestors
 
+    def _merged_csp(self, existing_policy: str | None) -> str:
+        """Splice (or replace) `frame-ancestors` into an existing CSP string.
+
+        Drops any prior `frame-ancestors` directive so ours wins, but keeps
+        every other directive (e.g. `default-src`, `script-src`) intact.
+        """
+        directive = f"frame-ancestors {self.frame_ancestors}"
+        if not existing_policy:
+            return directive
+        kept: list[str] = []
+        for part in existing_policy.split(";"):
+            stripped = part.strip()
+            if not stripped:
+                continue
+            if stripped.lower().startswith("frame-ancestors"):
+                continue
+            kept.append(stripped)
+        kept.append(directive)
+        return "; ".join(kept)
+
     async def dispatch(self, request: Request, call_next):
         response: Response = await call_next(request)
-        response.headers["Content-Security-Policy"] = (
-            f"frame-ancestors {self.frame_ancestors}"
+        response.headers["Content-Security-Policy"] = self._merged_csp(
+            response.headers.get("Content-Security-Policy")
         )
         # Some WSGI frontends inject X-Frame-Options=DENY by default; strip it
         # so browsers fall back to CSP frame-ancestors instead.
@@ -129,9 +166,11 @@ def create_app() -> FastAPI:
         CORSMiddleware,
         allow_origins=["*"],
         allow_methods=["*"],
-        # Atlas needs the session header to reach us; explicit allow is safer
-        # than `*` because some browsers disallow `*` with credentialed calls.
-        allow_headers=["*", "X-Session-Id"],
+        # `*` is intentionally permissive (dev-focused tool, no credentials).
+        # The explicit `X-Session-Id` echo is for `expose_headers` below — it
+        # has no effect on the request-side allowlist, which `*` already
+        # covers, but documents that this header is part of the API contract.
+        allow_headers=["*"],
         expose_headers=["X-Session-Id"],
     )
     app.add_middleware(
@@ -161,9 +200,24 @@ def create_app() -> FastAPI:
 
     @app.post("/api/reset")
     def reset(request: Request, session: str | None = Query(default=None)) -> dict:
-        sid = _session_id(request, session)
-        reset_service(sid)
-        return get_service(sid).get_state()
+        """Reset printer state.
+
+        Called *with* an explicit `X-Session-Id` header or `?session=` query
+        param: drops just that session's PrinterService.
+
+        Called *without* either: wipes every session's state. The pre-multiuser
+        contract was a global reset (used by the Playwright suite's
+        `beforeEach` hook), and silently demoting that to "default session
+        only" let stale agent state leak across runs. Operators who actually
+        want a single-session reset can pass the id explicitly.
+        """
+        header = request.headers.get("x-session-id")
+        explicit = header or session
+        if explicit:
+            reset_service(explicit)
+            return get_service(explicit).get_state()
+        reset_service()
+        return get_service().get_state()
 
     @app.post("/api/bed")
     def set_bed(body: BedSize, svc: PrinterService = Depends(session_service)) -> dict:

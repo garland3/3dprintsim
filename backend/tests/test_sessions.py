@@ -17,6 +17,7 @@ from fastapi.testclient import TestClient
 from app.main import create_app
 from app.state import (
     DEFAULT_SESSION_ID,
+    SessionRegistry,
     get_registry,
     get_service,
     reset_service,
@@ -204,6 +205,112 @@ def test_mcp_tool_calls_without_ctx_use_default_session():
     # Part landed in the "default" session's service, not some ephemeral one.
     assert len(data["parts"]) == 1
     assert len(get_service(DEFAULT_SESSION_ID).parts) == 1
+
+
+# --- review-fix regressions ------------------------------------------------
+
+
+def test_api_reset_without_session_wipes_all_sessions(client: TestClient):
+    """`/api/reset` with no header/query must wipe every session.
+
+    The Playwright MCP suite's beforeEach hook posts to /api/reset to start
+    each run from a clean slate; if that only cleared the "default" session,
+    Atlas-spawned sessions would leak parts/slices across test runs.
+    """
+    _upload(client, "alice")
+    _upload(client, "bob")
+    assert "alice" in get_registry().active_sessions()
+    assert "bob" in get_registry().active_sessions()
+
+    r = client.post("/api/reset")
+    assert r.status_code == 200
+    # Every session got dropped — alice and bob are gone, the default session
+    # was lazily recreated to serve the response payload, so it's the only
+    # entry left.
+    active = set(get_registry().active_sessions())
+    assert "alice" not in active
+    assert "bob" not in active
+
+
+def test_api_reset_with_explicit_session_only_drops_that_one(client: TestClient):
+    _upload(client, "alice")
+    _upload(client, "bob")
+
+    r = client.post("/api/reset", headers={"X-Session-Id": "alice"})
+    assert r.status_code == 200
+    # The response payload is alice's freshly-recreated state — empty parts.
+    assert r.json()["parts"] == []
+
+    # Bob is untouched: still has his cube.
+    bob_parts = client.get("/api/parts", headers={"X-Session-Id": "bob"}).json()
+    assert len(bob_parts) == 1
+
+    # And alice's state is genuinely empty.
+    alice_parts = client.get("/api/parts", headers={"X-Session-Id": "alice"}).json()
+    assert alice_parts == []
+
+
+def test_invalid_session_id_returns_400(client: TestClient):
+    """Charset-validated session ids: an attacker can't smuggle nul bytes,
+    very long strings, or path-style values into the registry keys."""
+    bad_ids = ["a/b", "x" * 200, "has space", "ctl\x01char", ""]
+    for bad in bad_ids:
+        r = client.get("/api/parts", headers={"X-Session-Id": bad})
+        # Empty-string falls through to DEFAULT_SESSION_ID rather than failing.
+        if bad == "":
+            assert r.status_code == 200
+        else:
+            assert r.status_code == 400, f"expected 400 for {bad!r}, got {r.status_code}"
+
+
+def test_session_registry_cap_blocks_unbounded_growth():
+    """A hostile client that rotates session ids must hit a hard cap rather
+    than OOM the process."""
+    reg = SessionRegistry(ttl_seconds=3600.0, max_sessions=3)
+    reg.get("a")
+    reg.get("b")
+    reg.get("c")
+    # The cap is honored — a fresh fourth id is rejected.
+    with pytest.raises(ValueError, match="session cap"):
+        reg.get("d")
+    # But re-using an existing session still works (no new allocation).
+    assert reg.get("a") is reg.get("a")
+
+
+def test_csp_middleware_preserves_existing_directives():
+    """The IframeEmbedMiddleware must splice frame-ancestors into an existing
+    CSP rather than nuking it. Otherwise a stricter upstream policy
+    (e.g. `default-src 'self'`) would silently disappear."""
+    from app.main import IframeEmbedMiddleware
+
+    mw = IframeEmbedMiddleware(app=None, frame_ancestors="https://atlas.example")
+
+    existing = "default-src 'self'; script-src 'self' 'unsafe-inline'"
+    merged = mw._merged_csp(existing)
+    assert "default-src 'self'" in merged
+    assert "script-src 'self' 'unsafe-inline'" in merged
+    assert "frame-ancestors https://atlas.example" in merged
+
+    # Existing frame-ancestors gets replaced, not duplicated.
+    with_old = "default-src 'self'; frame-ancestors 'none'"
+    merged = mw._merged_csp(with_old)
+    assert merged.count("frame-ancestors") == 1
+    assert "'none'" not in merged
+    assert "default-src 'self'" in merged
+
+    # No prior CSP → just our directive.
+    assert mw._merged_csp(None) == "frame-ancestors https://atlas.example"
+    assert mw._merged_csp("") == "frame-ancestors https://atlas.example"
+
+
+def test_session_ttl_env_falls_back_on_garbage(monkeypatch, caplog):
+    """A misconfigured `SESSION_TTL_SECONDS=forever` must not crash import."""
+    from app.state import _env_float
+
+    monkeypatch.setenv("BAD", "forever")
+    with caplog.at_level("WARNING"):
+        assert _env_float("BAD", 7.0) == 7.0
+    assert any("BAD" in r.message for r in caplog.records)
 
 
 def test_mcp_open_viewer_listed_in_tools():
