@@ -29,8 +29,15 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from .arrange import ArrangeError
 from .env import load_dotenv
+from .factory import FactoryService, is_factory_enabled
 from .mcp_server import build_mcp
-from .state import DEFAULT_SESSION_ID, PrinterService, get_service, reset_service
+from .state import (
+    DEFAULT_SESSION_ID,
+    PrinterService,
+    get_factory,
+    get_service,
+    reset_service,
+)
 
 load_dotenv()
 
@@ -107,6 +114,39 @@ class PartPositionRequest(BaseModel):
     y: float = Field(ge=0)
 
 
+class FactorySubmitRequest(BaseModel):
+    """Base64-encoded STL + slice params for a factory job submission.
+
+    Separate from the multipart `/api/factory/jobs/upload` endpoint so an MCP
+    agent or curl-based integration can submit a job without multipart
+    encoding. The slice params mirror `SliceRequest` but are all optional —
+    agents typically want "just print this" with sensible defaults.
+    """
+
+    name: str = ""
+    stl_base64: str
+    scale: float = Field(1.0, gt=0)
+    layer_height: float | None = Field(default=None, gt=0)
+    perimeters: int | None = Field(default=None, ge=1)
+    infill_density: float | None = Field(default=None, ge=0.0, le=1.0)
+    top_layers: int | None = Field(default=None, ge=0)
+    bottom_layers: int | None = Field(default=None, ge=0)
+    support_density: float | None = Field(default=None, ge=0.0, le=1.0)
+
+
+class FactoryConfigRequest(BaseModel):
+    """Live-edit knobs for the factory grid + sim + pricing model."""
+
+    rows: int | None = Field(default=None, ge=1, le=10)
+    cols: int | None = Field(default=None, ge=1, le=10)
+    shelf_pitch_mm: float | None = Field(default=None, gt=0)
+    seconds_per_mm_extruded: float | None = Field(default=None, gt=0)
+    unload_duration_s: float | None = Field(default=None, gt=0)
+    filament_price_per_kg_usd: float | None = Field(default=None, ge=0)
+    machine_cost_per_hour_usd: float | None = Field(default=None, ge=0)
+    sim_speed: float | None = Field(default=None, gt=0)
+
+
 def _session_id(request: Request, session: str | None = None) -> str:
     """Resolve the caller's session id from header-then-query, defaulting to
     the shared "default" session when neither is provided.
@@ -136,6 +176,28 @@ def session_service(
     """
     try:
         return get_service(_session_id(request, session))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def session_factory(
+    request: Request,
+    session: str | None = Query(default=None),
+) -> FactoryService:
+    """FastAPI dependency — returns the FactoryService for the caller's session.
+
+    Gates the whole factory API behind `FACTORY_ENABLED`: when the flag is
+    off, every factory endpoint returns 404 so this feature looks like it
+    simply doesn't exist. That lets operators ship the code dark and flip
+    the flag once they're ready.
+    """
+    if not is_factory_enabled():
+        raise HTTPException(
+            status_code=404,
+            detail="factory feature flag (FACTORY_ENABLED) is off",
+        )
+    try:
+        return get_factory(_session_id(request, session))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -545,6 +607,147 @@ def create_app() -> FastAPI:
     @app.post("/api/viewer/focus")
     def request_focus(svc: PrinterService = Depends(session_service)) -> dict:
         return {"focus_request": svc.request_focus()}
+
+    # --- factory-as-a-service endpoints ---
+
+    @app.get("/api/factory/status")
+    def factory_status() -> dict:
+        """Report whether the factory feature flag is currently on.
+
+        Unconditionally available (no 404 when off) so the UI can query at
+        boot and decide whether to render the factory tab. Every other
+        `/api/factory/*` route is gated on `is_factory_enabled()`.
+        """
+        return {"enabled": is_factory_enabled()}
+
+    @app.get("/api/factory/state")
+    def factory_state(fac: FactoryService = Depends(session_factory)) -> dict:
+        return fac.get_state()
+
+    @app.post("/api/factory/tick")
+    def factory_tick(fac: FactoryService = Depends(session_factory)) -> dict:
+        """Force a state-machine tick and return the new state.
+
+        Normally tick() runs on every read, but an explicit tick endpoint is
+        handy for tests and for UIs that want to advance the simulation at a
+        known cadence without polling GETs.
+        """
+        fac.tick()
+        return fac.get_state()
+
+    @app.post("/api/factory/reset")
+    def factory_reset(fac: FactoryService = Depends(session_factory)) -> dict:
+        fac.reset()
+        return fac.get_state()
+
+    @app.post("/api/factory/config")
+    def factory_config(
+        body: FactoryConfigRequest,
+        fac: FactoryService = Depends(session_factory),
+    ) -> dict:
+        try:
+            fac.configure(**body.model_dump(exclude_none=True))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return fac.get_state()
+
+    @app.post("/api/factory/jobs/upload")
+    async def factory_upload_job(
+        file: UploadFile = File(...),
+        scale: float = Form(1.0),
+        layer_height: float | None = Form(None),
+        perimeters: int | None = Form(None),
+        infill_density: float | None = Form(None),
+        top_layers: int | None = Form(None),
+        bottom_layers: int | None = Form(None),
+        support_density: float | None = Form(None),
+        fac: FactoryService = Depends(session_factory),
+    ) -> dict:
+        """Submit a factory job from a multipart STL upload.
+
+        This is the single "upload + slice + start" command the spec calls
+        for: drop a file, it gets sliced, queued, and routed to the next
+        available printer. No separate slice or simulation step — the
+        factory owns the full pipeline end-to-end.
+        """
+        data = await file.read()
+        name = file.filename or "job.stl"
+        params = {
+            k: v
+            for k, v in {
+                "layer_height": layer_height,
+                "perimeters": perimeters,
+                "infill_density": infill_density,
+                "top_layers": top_layers,
+                "bottom_layers": bottom_layers,
+                "support_density": support_density,
+            }.items()
+            if v is not None
+        }
+        try:
+            job = fac.submit_job(name, data, scale=scale, slice_params=params)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return job.to_public(fac._clock())
+
+    @app.post("/api/factory/jobs")
+    def factory_submit_job(
+        body: FactorySubmitRequest,
+        fac: FactoryService = Depends(session_factory),
+    ) -> dict:
+        """Submit a factory job via base64-encoded STL (MCP-friendly path)."""
+        params = {
+            k: v
+            for k, v in {
+                "layer_height": body.layer_height,
+                "perimeters": body.perimeters,
+                "infill_density": body.infill_density,
+                "top_layers": body.top_layers,
+                "bottom_layers": body.bottom_layers,
+                "support_density": body.support_density,
+            }.items()
+            if v is not None
+        }
+        try:
+            job = fac.submit_job_base64(
+                body.name or "job.stl",
+                body.stl_base64,
+                scale=body.scale,
+                slice_params=params,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return job.to_public(fac._clock())
+
+    @app.get("/api/factory/jobs")
+    def factory_list_jobs(
+        status: str | None = Query(default=None),
+        fac: FactoryService = Depends(session_factory),
+    ) -> list[dict]:
+        now = fac._clock()
+        return [j.to_public(now) for j in fac.list_jobs(status=status)]
+
+    @app.get("/api/factory/jobs/{job_id}")
+    def factory_get_job(
+        job_id: str,
+        fac: FactoryService = Depends(session_factory),
+    ) -> dict:
+        try:
+            job = fac.get_job(job_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return job.to_public(fac._clock())
+
+    @app.post("/api/factory/jobs/{job_id}/cancel")
+    def factory_cancel_job(
+        job_id: str,
+        fac: FactoryService = Depends(session_factory),
+    ) -> dict:
+        try:
+            job = fac.cancel_job(job_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return job.to_public(fac._clock())
 
     # Register SPA routes last so the `/{path:path}` catch-all can't preempt
     # any `/api/*` handler above. See `_mount_frontend` for detail.

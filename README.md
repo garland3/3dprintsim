@@ -29,6 +29,11 @@ Three ways to drive it:
   plate; `auto_arrange` centers the packed block instead of hugging the corner.
   Oversize parts stay unplaced and surface a 409 from `/api/slice` rather than
   silently producing out-of-bounds toolpaths.
+- **Factory-as-a-service** (behind `FACTORY_ENABLED=1`). A grid of simulated
+  printers with a FIFO job queue, a pick-and-place robot, and real-time
+  progress tracking. One `factory_submit_job(...)` MCP call (or
+  `POST /api/factory/jobs/upload`) covers upload + slice + queue + route.
+  Tracks filament + cost per printer. See [`docs/factory.md`](docs/factory.md).
 
 ## Quickstart
 

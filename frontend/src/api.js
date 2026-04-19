@@ -127,4 +127,35 @@ export const api = {
   viewerRequests: () => getJSON('/api/viewer/requests'),
   requestFocus: () =>
     fetch('/api/viewer/focus', { method: 'POST', headers: SESSION_HEADERS }).then(json),
+
+  // --- factory-as-a-service ---
+  // Gated behind FACTORY_ENABLED on the backend. `factoryStatus()` is always
+  // available and returns {enabled: bool} so the UI can decide whether to
+  // render the factory tab without guessing.
+  factoryStatus: () => getJSON('/api/factory/status'),
+  factoryState: () => getJSON('/api/factory/state'),
+  factoryTick: () =>
+    fetch('/api/factory/tick', { method: 'POST', headers: SESSION_HEADERS }).then(json),
+  factorySubmitJobFile: (file, params = {}) => {
+    const fd = new FormData();
+    fd.append('file', file);
+    for (const [k, v] of Object.entries(params)) {
+      if (v !== undefined && v !== null && v !== '') fd.append(k, String(v));
+    }
+    return fetch('/api/factory/jobs/upload', {
+      method: 'POST',
+      headers: SESSION_HEADERS,
+      body: fd,
+    }).then(json);
+  },
+  factoryListJobs: (status) =>
+    getJSON(`/api/factory/jobs${status ? `?status=${encodeURIComponent(status)}` : ''}`),
+  factoryCancelJob: (id) =>
+    fetch(`/api/factory/jobs/${id}/cancel`, {
+      method: 'POST',
+      headers: SESSION_HEADERS,
+    }).then(json),
+  factoryConfig: (cfg) => postJSON('/api/factory/config', cfg),
+  factoryReset: () =>
+    fetch('/api/factory/reset', { method: 'POST', headers: SESSION_HEADERS }).then(json),
 };

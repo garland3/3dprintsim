@@ -451,3 +451,252 @@ button { min-height: 32px; display: inline-flex; align-items: center; justify-co
   color: #8b9299;
   font-size: 10px;
 }
+
+/* --- factory-as-a-service view --- */
+
+.factory-toggle { margin-left: auto; padding: 4px 10px; font-size: 11px; }
+button.small { padding: 4px 8px; font-size: 11px; }
+
+.factory-app { grid-template-columns: 320px 1fr; }
+.factory-sidebar { border-right: 1px solid #1f242b; }
+.factory-sidebar h2 { margin-top: 20px; }
+
+.factory-main {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  background: #0b0d10;
+  color: #e6e7e9;
+  overflow: hidden;
+}
+
+.factory-header {
+  display: flex;
+  gap: 20px;
+  padding: 14px 20px;
+  border-bottom: 1px solid #1f242b;
+  background: #101318;
+}
+.header-stat { min-width: 90px; }
+.header-stat .stat-label {
+  color: #8b9299;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+}
+.header-stat .stat-value {
+  font-size: 20px;
+  font-weight: 500;
+  margin-top: 2px;
+}
+
+.factory-body {
+  display: grid;
+  grid-template-columns: 1fr 320px;
+  flex: 1;
+  min-height: 0;
+}
+
+.factory-shelf-wrap {
+  padding: 20px;
+  overflow: auto;
+  /* The shelves behind the printers — diagonal stripes to read as "wood". */
+  background:
+    repeating-linear-gradient(
+      135deg,
+      #0d1015 0 10px,
+      #11141a 10px 20px
+    );
+}
+
+.factory-shelf {
+  position: relative;
+  display: grid;
+  gap: 14px;
+  min-height: 400px;
+}
+
+.printer-tile {
+  position: relative;
+  background: #161a20;
+  border: 1px solid #222830;
+  border-left: 4px solid #3a82e4;
+  border-radius: 8px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 12px;
+  transition: box-shadow 120ms ease, border-color 120ms ease;
+}
+.printer-tile.status-printing {
+  box-shadow: 0 0 16px -4px rgba(255, 145, 48, 0.35);
+}
+.printer-tile.status-unloading {
+  box-shadow: 0 0 16px -4px rgba(242, 209, 77, 0.45);
+}
+.printer-tile.status-finished {
+  box-shadow: 0 0 16px -4px rgba(88, 204, 140, 0.35);
+}
+
+.tile-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.led {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  box-shadow: 0 0 6px currentColor;
+}
+.tile-name { font-weight: 500; flex: 1; }
+.tile-status {
+  font-size: 10px;
+  color: #8b9299;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+}
+.tile-job {
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tile-job.muted { color: #5f6770; font-style: italic; }
+.tile-meta {
+  display: flex;
+  justify-content: space-between;
+  color: #8b9299;
+  font-size: 10px;
+}
+.tile-lifetime {
+  color: #5f6770;
+  font-size: 10px;
+  margin-top: auto;
+}
+.tile-cancel {
+  margin-top: 4px;
+  padding: 3px 8px;
+  font-size: 10px;
+  align-self: flex-start;
+}
+
+.progress-bar {
+  width: 100%;
+  height: 6px;
+  border-radius: 3px;
+  background: #0a0c10;
+  overflow: hidden;
+}
+.progress-bar.small { height: 4px; }
+.progress-fill {
+  height: 100%;
+  background: #ff9130;
+  transition: width 300ms ease;
+}
+
+.factory-robot {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  transition: left 800ms cubic-bezier(0.4, 0, 0.2, 1),
+              top 800ms cubic-bezier(0.4, 0, 0.2, 1);
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  pointer-events: none;
+}
+.robot-body {
+  font-size: 26px;
+  filter: drop-shadow(0 0 6px rgba(242, 209, 77, 0.5));
+}
+.factory-robot.status-unloading .robot-body {
+  animation: robotBusy 600ms ease-in-out infinite alternate;
+}
+@keyframes robotBusy {
+  from { transform: translateY(0); }
+  to { transform: translateY(-3px); }
+}
+.robot-progress {
+  width: 36px;
+  height: 3px;
+  background: rgba(0, 0, 0, 0.4);
+  border-radius: 2px;
+  margin-top: 2px;
+  overflow: hidden;
+}
+.robot-progress-fill {
+  height: 100%;
+  background: #f2d14d;
+  transition: width 300ms ease;
+}
+
+.factory-queue {
+  border-left: 1px solid #1f242b;
+  padding: 14px 16px;
+  overflow-y: auto;
+  background: #0e1116;
+}
+.factory-queue h2 { margin-top: 0; }
+
+.job-list { list-style: none; padding: 0; margin: 0; }
+.job-list.empty {
+  color: #5f6770;
+  font-style: italic;
+  padding: 12px 0;
+}
+.job {
+  background: #161a20;
+  border: 1px solid #222830;
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin-bottom: 6px;
+  font-size: 11px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.job-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+.job-name {
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+}
+.job-meta {
+  display: flex;
+  gap: 8px;
+  color: #8b9299;
+  font-size: 10px;
+  flex-wrap: wrap;
+}
+.job-error {
+  color: #e04040;
+  font-size: 10px;
+}
+.badge {
+  font-size: 9px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: #2a313a;
+  color: #8b9299;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+.badge.status-queued { background: #1a2330; color: #7bb4ff; }
+.badge.status-printing { background: #3a2418; color: #ff9130; }
+.badge.status-finished { background: #18321f; color: #58cc8c; }
+.badge.status-unloaded { background: #1e2a2a; color: #8b9299; }
+.badge.status-cancelled { background: #2d1a1a; color: #d87272; }
+.badge.status-failed { background: #2d1a1a; color: #e04040; }
+
+.job-status-printing { border-color: #3a2418; }
+.job-status-finished { border-color: #18321f; }
+.job-status-failed { border-color: #2d1a1a; }
