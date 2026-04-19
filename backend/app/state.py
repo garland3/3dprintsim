@@ -591,6 +591,11 @@ class SessionRegistry:
     also enforce a hard cap on the number of concurrently live sessions and a
     charset whitelist on the id itself — together that prevents a hostile
     client from spinning up unbounded PrinterServices to OOM the process.
+
+    The factory-as-a-service layer lives alongside: each session gets a
+    lazily-created `FactoryService` (see `get_factory`) keyed on the same
+    session id so an MCP agent's factory view and the browser tab's grid view
+    share state without leaking across users.
     """
 
     def __init__(
@@ -600,6 +605,7 @@ class SessionRegistry:
     ) -> None:
         self._lock = threading.RLock()
         self._services: dict[str, PrinterService] = {}
+        self._factories: dict[str, "FactoryService"] = {}
         self._last_seen: dict[str, float] = {}
         self.ttl_seconds = ttl_seconds
         self.max_sessions = max_sessions
@@ -629,16 +635,43 @@ class SessionRegistry:
             self._last_seen[sid] = now
             return svc
 
+    def get_factory(self, session_id: str | None) -> "FactoryService":
+        """Return (and create-on-miss) the FactoryService for `session_id`.
+
+        Lazily imports `factory` so the state module can be imported without
+        pulling in the factory code path. Tests that don't exercise the
+        factory stay unaffected.
+        """
+        from .factory import FactoryService  # local import: see module docstring
+
+        sid = _validate_session_id(session_id or DEFAULT_SESSION_ID)
+        now = time.monotonic()
+        with self._lock:
+            self._evict_idle_locked(now)
+            fac = self._factories.get(sid)
+            if fac is None:
+                if len(self._factories) >= self.max_sessions:
+                    raise ValueError(
+                        f"session cap reached ({self.max_sessions}); "
+                        "refusing to allocate a new FactoryService"
+                    )
+                fac = FactoryService()
+                self._factories[sid] = fac
+            self._last_seen[sid] = now
+            return fac
+
     def drop(self, session_id: str) -> None:
         """Explicit eviction — used by `reset_service(session_id)`."""
         with self._lock:
             self._services.pop(session_id, None)
+            self._factories.pop(session_id, None)
             self._last_seen.pop(session_id, None)
 
     def reset(self) -> None:
         """Wipe the entire registry. Used by tests and the global `/api/reset`."""
         with self._lock:
             self._services.clear()
+            self._factories.clear()
             self._last_seen.clear()
 
     def _evict_idle_locked(self, now: float) -> None:
@@ -648,6 +681,7 @@ class SessionRegistry:
         stale = [sid for sid, ts in self._last_seen.items() if ts < cutoff]
         for sid in stale:
             self._services.pop(sid, None)
+            self._factories.pop(sid, None)
             self._last_seen.pop(sid, None)
 
     def active_sessions(self) -> list[str]:
@@ -723,12 +757,23 @@ def reset_service(session_id: str | None = None) -> None:
         _registry.drop(session_id)
 
 
+def get_factory(session_id: str | None = None):
+    """Return the FactoryService bound to `session_id`.
+
+    Mirrors `get_service()` — useful for tests and for the HTTP/MCP surfaces
+    that want the per-session factory without having to import FactoryService
+    themselves.
+    """
+    return _registry.get_factory(session_id)
+
+
 __all__ = [
     "ArrangeError",
     "DEFAULT_SESSION_ID",
     "PrinterService",
     "Part",
     "SessionRegistry",
+    "get_factory",
     "get_registry",
     "get_service",
     "reset_service",

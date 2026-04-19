@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api } from './api.js';
+import FactoryView from './FactoryView.jsx';
 import { PrinterScene } from './PrinterScene.js';
 
 // 1 inch in mm — used when the user picks "inches" from the unit dropdown.
@@ -162,6 +163,12 @@ export default function App() {
   const [sections, setSections] = useState(initialPrefs.sections);
   const [helpOpen, setHelpOpen] = useState(false);
   const [printerPresetName, setPrinterPresetName] = useState('');
+  // Factory-mode toggle. `factoryEnabled` is the feature flag result from
+  // the backend; `factoryMode` is the current view selection. When the flag
+  // is off we never render the factory toggle in the sidebar so the legacy
+  // UI stays uncluttered.
+  const [factoryEnabled, setFactoryEnabled] = useState(false);
+  const [factoryMode, setFactoryMode] = useState(false);
   // Synchronous mirror of `pending`. React's setPending is async/batched, so a
   // guard that reads the state-updater closure can miss a rapid re-entrant
   // click. The ref gives us an immediate lockout before we kick off `fn`.
@@ -392,6 +399,20 @@ export default function App() {
 
   useEffect(() => { refreshState(); }, [refreshState]);
 
+  // Probe the factory feature flag once at boot. The endpoint is always
+  // available even when the flag is off — it just returns {enabled: false}.
+  useEffect(() => {
+    let cancelled = false;
+    api.factoryStatus().then((r) => {
+      if (!cancelled) setFactoryEnabled(Boolean(r?.enabled));
+    }).catch(() => {
+      // Backend unreachable or returned an error; treat as disabled so the
+      // UI never offers a factory button that doesn't work.
+      if (!cancelled) setFactoryEnabled(false);
+    });
+    return () => { cancelled = true; };
+  }, []);
+
   // Refresh part geometries whenever the parts list changes.
   useEffect(() => {
     let cancelled = false;
@@ -619,11 +640,29 @@ export default function App() {
     : null;
   const totalLayers = sliceSummary?.layer_count ?? 0;
 
+  // Factory mode takes over the whole window — its sidebar + grid own the
+  // layout. Rendered unconditionally of the single-printer state so the
+  // PrinterScene effect above keeps the single-printer scene warm and the
+  // user's "back" button returns instantly without a re-init.
+  if (factoryMode && factoryEnabled) {
+    return <FactoryView onBack={() => setFactoryMode(false)} />;
+  }
+
   return (
     <div className="app">
       <aside className="sidebar" data-testid="sidebar">
         <div className="sidebar-head">
           <h1>3D Print Sim</h1>
+          {factoryEnabled ? (
+            <button
+              className="secondary small factory-toggle"
+              onClick={() => setFactoryMode(true)}
+              title="Switch to factory-as-a-service view"
+              data-testid="factory-toggle"
+            >
+              Factory →
+            </button>
+          ) : null}
           <button
             className="icon help-btn"
             onClick={() => setHelpOpen(true)}

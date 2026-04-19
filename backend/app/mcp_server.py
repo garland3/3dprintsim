@@ -24,7 +24,8 @@ import httpx
 from fastmcp import Context, FastMCP
 from fastmcp.server.dependencies import get_http_headers
 
-from .state import DEFAULT_SESSION_ID, PrinterService, get_service
+from .factory import FactoryService, is_factory_enabled
+from .state import DEFAULT_SESSION_ID, PrinterService, get_factory, get_service
 
 
 # Atlas file-upload handoff: when an Atlas host injects a file into an MCP call
@@ -230,16 +231,38 @@ def _svc(ctx: Context | None) -> PrinterService:
     return get_service(_session_id(ctx))
 
 
+def _factory(ctx: Context | None) -> FactoryService:
+    """Return the session's FactoryService or raise if the feature flag is off.
+
+    Raised as a plain ValueError so FastMCP surfaces it as a tool error back
+    to the agent — same shape as every other guard in this module.
+    """
+    if not is_factory_enabled():
+        raise ValueError(
+            "factory feature flag (FACTORY_ENABLED) is off; "
+            "set FACTORY_ENABLED=1 to enable the factory manager"
+        )
+    return get_factory(_session_id(ctx))
+
+
 def build_mcp() -> FastMCP:
     mcp = FastMCP(
         name="3dprintsim",
         instructions=(
-            "Tools for driving a virtual FDM 3D printer. Typical flow: "
-            "set_bed_size → upload_stl (one or more) → auto_arrange → "
-            "slice_all → start_simulation → step_simulation until finished. "
-            "Call open_viewer early to pop the live 3D canvas into the Atlas "
-            "UI so the user can watch the print. Use get_printer_state at "
-            "any time to inspect."
+            "Tools for driving a virtual FDM 3D printer. Two ways to use it:\n\n"
+            "1. Single-printer flow (always available): set_bed_size → "
+            "upload_stl → auto_arrange → slice_all → start_simulation → "
+            "step_simulation until finished. Call open_viewer early to pop "
+            "the live 3D canvas into the Atlas UI.\n\n"
+            "2. Factory-as-a-service (when FACTORY_ENABLED=1): a grid of "
+            "simulated printers with a job queue and a pick-and-place robot. "
+            "factory_submit_job is the single-command entry point — one call "
+            "uploads, slices, queues, and auto-routes a job to the next "
+            "available printer, with real-time progress. Use factory_status "
+            "first to check the flag; then factory_list_printers / "
+            "factory_list_jobs / factory_get_job / factory_stats to inspect.\n\n"
+            "Both surfaces share the session, so you can mix them. Use "
+            "get_printer_state at any time for the single-printer view."
         ),
     )
 
@@ -514,6 +537,218 @@ def build_mcp() -> FastMCP:
         effect is visible in a running UI session within a couple of seconds.
         """
         return {"focus_request": _svc(ctx).request_focus()}
+
+    # --- factory-as-a-service tools ---
+    #
+    # All factory tools raise if FACTORY_ENABLED is off, so an agent gets a
+    # clear "feature disabled" error instead of a mystery 404. An operator
+    # flipping the env var and restarting turns every tool below on at once.
+
+    @mcp.tool
+    def factory_status(ctx: Context) -> dict:
+        """Report whether the factory manager (grid of printers + job queue) is on.
+
+        Agents should call this once at the start of a session before
+        attempting `factory_submit_job` etc — the factory is behind a
+        feature flag and only available when `FACTORY_ENABLED=1`.
+        """
+        return {"enabled": is_factory_enabled()}
+
+    @mcp.tool
+    def factory_state(ctx: Context) -> dict:
+        """Return the full factory state: printers, queue, jobs, robot, stats."""
+        return _factory(ctx).get_state()
+
+    @mcp.tool
+    def factory_list_printers(ctx: Context) -> list[dict]:
+        """List every printer in the factory grid with status + lifetime stats."""
+        fac = _factory(ctx)
+        fac.tick()
+        return [p.to_public() for p in fac.printers]
+
+    @mcp.tool
+    def factory_list_jobs(ctx: Context, status: str = "") -> list[dict]:
+        """List jobs in the factory queue. Optionally filter by status
+        ("queued", "printing", "finished", "unloaded", "cancelled", "failed").
+        """
+        fac = _factory(ctx)
+        jobs = fac.list_jobs(status=status or None)
+        now = fac._clock()
+        return [j.to_public(now) for j in jobs]
+
+    @mcp.tool
+    def factory_get_job(job_id: str, ctx: Context) -> dict:
+        """Fetch a single job's status, progress, timing, and cost."""
+        fac = _factory(ctx)
+        job = fac.get_job(job_id)
+        return job.to_public(fac._clock())
+
+    @mcp.tool
+    def factory_cancel_job(job_id: str, ctx: Context) -> dict:
+        """Cancel a queued or in-flight job and free the assigned printer."""
+        fac = _factory(ctx)
+        job = fac.cancel_job(job_id)
+        return job.to_public(fac._clock())
+
+    @mcp.tool
+    def factory_stats(ctx: Context) -> dict:
+        """Aggregate lifetime totals: prints, filament, time, cost, queue depth."""
+        return _factory(ctx).stats()
+
+    @mcp.tool
+    def factory_configure(
+        ctx: Context,
+        rows: int | None = None,
+        cols: int | None = None,
+        shelf_pitch_mm: float | None = None,
+        seconds_per_mm_extruded: float | None = None,
+        unload_duration_s: float | None = None,
+        filament_price_per_kg_usd: float | None = None,
+        machine_cost_per_hour_usd: float | None = None,
+        sim_speed: float | None = None,
+    ) -> dict:
+        """Live-edit factory config: grid shape, sim speed, and pricing.
+
+        Changing rows/cols rebuilds the printer grid — any in-flight prints
+        are requeued (they lose progress but not their place in the queue).
+        Pricing + sim_speed changes apply to new jobs only; jobs already
+        costed at submit time keep their original estimate.
+        """
+        fac = _factory(ctx)
+        updates = {
+            "rows": rows,
+            "cols": cols,
+            "shelf_pitch_mm": shelf_pitch_mm,
+            "seconds_per_mm_extruded": seconds_per_mm_extruded,
+            "unload_duration_s": unload_duration_s,
+            "filament_price_per_kg_usd": filament_price_per_kg_usd,
+            "machine_cost_per_hour_usd": machine_cost_per_hour_usd,
+            "sim_speed": sim_speed,
+        }
+        cfg = fac.configure(**{k: v for k, v in updates.items() if v is not None})
+        return {
+            "rows": cfg.rows,
+            "cols": cfg.cols,
+            "shelf_pitch_mm": cfg.shelf_pitch_mm,
+            "seconds_per_mm_extruded": cfg.seconds_per_mm_extruded,
+            "unload_duration_s": cfg.unload_duration_s,
+            "filament_price_per_kg_usd": cfg.filament_price_per_kg_usd,
+            "machine_cost_per_hour_usd": cfg.machine_cost_per_hour_usd,
+            "sim_speed": cfg.sim_speed,
+        }
+
+    @mcp.tool
+    def factory_reset(ctx: Context) -> dict:
+        """Wipe every printer, job, and robot back to a fresh factory floor."""
+        fac = _factory(ctx)
+        fac.reset()
+        return fac.get_state()
+
+    @mcp.tool
+    def factory_submit_job(
+        name: str,
+        stl_base64: str,
+        ctx: Context,
+        scale: float = 1.0,
+        layer_height_mm: float | None = None,
+        perimeters: int | None = None,
+        infill_density: float | None = None,
+        top_layers: int | None = None,
+        bottom_layers: int | None = None,
+        support_density: float | None = None,
+    ) -> dict:
+        """Submit a print job — the single-command factory entry point.
+
+        One call covers: upload STL → slice with the given params → queue
+        for the next available printer → start printing when a slot opens.
+        No separate slice, arrange, or simulation step is required — the
+        factory owns the whole pipeline and the queue picks the first free
+        printer in grid order.
+
+        Returns the created job's metadata (id, estimated duration, filament
+        usage, cost). Poll `factory_get_job(id)` for progress or
+        `factory_state()` to see the whole grid.
+        """
+        params = {
+            "layer_height": layer_height_mm,
+            "perimeters": perimeters,
+            "infill_density": infill_density,
+            "top_layers": top_layers,
+            "bottom_layers": bottom_layers,
+            "support_density": support_density,
+        }
+        params = {k: v for k, v in params.items() if v is not None}
+        fac = _factory(ctx)
+        job = fac.submit_job_base64(
+            name or "job.stl",
+            stl_base64,
+            scale=scale,
+            slice_params=params,
+        )
+        return job.to_public(fac._clock())
+
+    @mcp.tool
+    def factory_atlas_submit_job(
+        filename: str,
+        ctx: Context,
+        name: str = "",
+        scale: float = 1.0,
+        layer_height_mm: float | None = None,
+        perimeters: int | None = None,
+        infill_density: float | None = None,
+        top_layers: int | None = None,
+        bottom_layers: int | None = None,
+        support_density: float | None = None,
+    ) -> dict:
+        """Submit a factory job from an Atlas-hosted STL file.
+
+        Same as `atlas_upload` but routes straight into the factory queue:
+        one call to go from "user dropped a file in Atlas" to "factory
+        starts printing on the next free machine".
+        """
+        if not filename:
+            raise ValueError("filename (Atlas download URL) is required")
+        url = _normalize_atlas_url(filename)
+        _reject_ssrf(url)
+        try:
+            with httpx.Client(
+                timeout=_ATLAS_FETCH_TIMEOUT, follow_redirects=False
+            ) as client:
+                with client.stream("GET", url) as resp:
+                    resp.raise_for_status()
+                    chunks: list[bytes] = []
+                    total = 0
+                    for chunk in resp.iter_bytes():
+                        total += len(chunk)
+                        if total > _ATLAS_MAX_BYTES:
+                            raise ValueError(
+                                f"Atlas file exceeds "
+                                f"{_ATLAS_MAX_BYTES // (1024 * 1024)} MiB cap"
+                            )
+                        chunks.append(chunk)
+                    data = b"".join(chunks)
+        except httpx.HTTPStatusError as exc:
+            raise ValueError(
+                f"Atlas download failed: HTTP {exc.response.status_code}"
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise ValueError(f"Atlas download failed: {exc}") from exc
+
+        display_name = name.strip() if name and name.strip() else _atlas_display_name(url)
+        params = {
+            "layer_height": layer_height_mm,
+            "perimeters": perimeters,
+            "infill_density": infill_density,
+            "top_layers": top_layers,
+            "bottom_layers": bottom_layers,
+            "support_density": support_density,
+        }
+        params = {k: v for k, v in params.items() if v is not None}
+        fac = _factory(ctx)
+        job = fac.submit_job(
+            display_name, data, scale=scale, slice_params=params
+        )
+        return job.to_public(fac._clock())
 
     @mcp.tool
     def open_viewer(ctx: Context, title: str = "3D Print Simulator") -> dict:
