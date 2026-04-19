@@ -18,6 +18,7 @@ import contextlib
 import os
 from dataclasses import asdict
 from pathlib import Path
+from typing import Literal
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -48,6 +49,23 @@ class SliceRequest(BaseModel):
     bottom_layers: int = Field(3, ge=0)
     nozzle_width: float = Field(0.4, gt=0)
     support_density: float = Field(0.25, ge=0.0, le=1.0)
+    # Optional G-code / toolpath params. None = use the slicer's default so
+    # minimal callers (existing frontend, tests) don't need to set them.
+    retract_mm: float | None = Field(default=None, ge=0.0)
+    retract_speed: float | None = Field(default=None, gt=0.0)
+    hotend_temp: float | None = Field(default=None, ge=0.0)
+    bed_temp: float | None = Field(default=None, ge=0.0)
+    fan_speed: int | None = Field(default=None, ge=0, le=255)
+    first_layer_fan: int | None = Field(default=None, ge=0, le=255)
+    bridge_fan: int | None = Field(default=None, ge=0, le=255)
+    bridge_speed_factor: float | None = Field(default=None, gt=0.0, le=1.0)
+    seam_position: Literal["auto", "aligned", "rear", "nearest"] | None = None
+    first_layer_height: float | None = Field(default=None, gt=0.0)
+    first_layer_speed: float | None = Field(default=None, gt=0.0)
+    brim_loops: int | None = Field(default=None, ge=0)
+    adaptive_layers: bool | None = None
+    layer_height_min: float | None = Field(default=None, gt=0.0)
+    layer_height_max: float | None = Field(default=None, gt=0.0)
 
 
 class SimulationStartRequest(BaseModel):
@@ -64,6 +82,29 @@ class SimulationCursorRequest(BaseModel):
 
 class PartScaleRequest(BaseModel):
     scale: float = Field(gt=0)
+
+
+class PartRotateRequest(BaseModel):
+    """Incremental per-part rotation around a world axis, or a reset to identity.
+
+    `reset=True` clears the stored orientation and ignores axis/degrees, so
+    the UI only needs one endpoint for both "rotate" and "unrotate".
+    """
+
+    axis: Literal["x", "y", "z"] = "z"
+    degrees: float = 0.0
+    reset: bool = False
+
+
+class PartPositionRequest(BaseModel):
+    """Manual placement of a part's min-corner on the bed in mm.
+
+    Backend clamps to the bed, so callers can send raw drag deltas without
+    having to clamp client-side.
+    """
+
+    x: float = Field(ge=0)
+    y: float = Field(ge=0)
 
 
 def _session_id(request: Request, session: str | None = None) -> str:
@@ -338,6 +379,36 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return part.to_public()
 
+    @app.post("/api/parts/{part_id}/rotate")
+    def rotate_part(
+        part_id: str,
+        body: PartRotateRequest,
+        svc: PrinterService = Depends(session_service),
+    ) -> dict:
+        try:
+            part = svc.rotate_part(
+                part_id, body.axis, body.degrees, reset=body.reset
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return part.to_public()
+
+    @app.post("/api/parts/{part_id}/position")
+    def set_part_position(
+        part_id: str,
+        body: PartPositionRequest,
+        svc: PrinterService = Depends(session_service),
+    ) -> dict:
+        try:
+            part = svc.set_part_position(part_id, body.x, body.y)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return part.to_public()
+
     @app.get("/api/parts")
     def list_parts(svc: PrinterService = Depends(session_service)) -> list[dict]:
         return [p.to_public() for p in svc.parts.values()]
@@ -395,6 +466,21 @@ def create_app() -> FastAPI:
                 bottom_layers=req.bottom_layers,
                 nozzle_width=req.nozzle_width,
                 support_density=req.support_density,
+                retract_mm=req.retract_mm,
+                retract_speed=req.retract_speed,
+                hotend_temp=req.hotend_temp,
+                bed_temp=req.bed_temp,
+                fan_speed=req.fan_speed,
+                first_layer_fan=req.first_layer_fan,
+                bridge_fan=req.bridge_fan,
+                bridge_speed_factor=req.bridge_speed_factor,
+                seam_position=req.seam_position,
+                first_layer_height=req.first_layer_height,
+                first_layer_speed=req.first_layer_speed,
+                brim_loops=req.brim_loops,
+                adaptive_layers=req.adaptive_layers,
+                layer_height_min=req.layer_height_min,
+                layer_height_max=req.layer_height_max,
             )
         except ArrangeError as exc:
             # slice_all() implicitly auto-arranges unplaced parts; surface bed

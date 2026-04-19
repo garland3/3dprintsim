@@ -65,6 +65,9 @@ export class PrinterScene {
     // Hide the blue ghost toolpath by default — users asked to keep it off
     // unless they opt in.
     this.toolpathGroup.visible = false;
+    // Hide part meshes while simulation is progressing so printed filament
+    // reads cleanly. Flipped by `setPartsSimVisible` from the React side.
+    this._partsSimVisible = false;
 
     this.head = this.makeHead();
     this.scene.add(this.head);
@@ -147,18 +150,71 @@ export class PrinterScene {
     let panning = false;
     let lastX = 0;
     let lastY = 0;
-    // Reusable scratch vectors for pan basis extraction; hoisted so mousemove
-    // doesn't allocate on every frame.
     const panRight = new THREE.Vector3();
     const panUp = new THREE.Vector3();
     const panFwd = new THREE.Vector3();
 
+    // Per-drag state for part-repositioning. When a plain-left click lands
+    // on a part mesh we suppress orbit for that gesture and translate the
+    // mesh along the bed plane instead.
+    const raycaster = new THREE.Raycaster();
+    const ndc = new THREE.Vector2();
+    const bedPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+    const hit = new THREE.Vector3();
+    this._partDrag = null; // { mesh, partId, baseX, baseZ, anchorX, anchorZ }
+
+    const pointerToBed = (e) => {
+      const rect = c.getBoundingClientRect();
+      ndc.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+      ndc.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+      raycaster.setFromCamera(ndc, this.camera);
+      return raycaster.ray.intersectPlane(bedPlane, hit) ? hit.clone() : null;
+    };
+
+    const pickPart = (e) => {
+      const rect = c.getBoundingClientRect();
+      ndc.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+      ndc.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+      raycaster.setFromCamera(ndc, this.camera);
+      const hits = raycaster.intersectObjects(this.partsGroup.children, false);
+      for (const h of hits) {
+        const pid = h.object?.userData?.partId;
+        if (pid) return { mesh: h.object, partId: pid };
+      }
+      return null;
+    };
+
     const mousedown = (e) => {
-      // Right mouse button OR shift+left = pan; plain left = rotate.
       if (e.button === 2 || (e.button === 0 && e.shiftKey)) {
         panning = true;
         dragging = false;
       } else if (e.button === 0) {
+        // Try to pick a part first — if the click lands on one, the gesture
+        // repositions that part rather than orbiting the camera.
+        const picked = pickPart(e);
+        const anchor = picked ? pointerToBed(e) : null;
+        if (picked && anchor) {
+          const mesh = picked.mesh;
+          if (!mesh.geometry.boundingBox) mesh.geometry.computeBoundingBox();
+          const bb = mesh.geometry.boundingBox;
+          this._partDrag = {
+            mesh,
+            partId: picked.partId,
+            // Triangles are already in world/bed coords; mesh.position is
+            // (0,0,0) at rest. On release we compute the new min-corner as
+            // bb.min + current offset and hand it up for persistence.
+            baseMinX: bb.min.x,
+            baseMinZ: bb.min.z,
+            width: bb.max.x - bb.min.x,
+            depth: bb.max.z - bb.min.z,
+            anchorX: anchor.x,
+            anchorZ: anchor.z,
+          };
+          dragging = false;
+          panning = false;
+          e.preventDefault();
+          return;
+        }
         dragging = true;
         panning = false;
       } else {
@@ -169,28 +225,59 @@ export class PrinterScene {
       e.preventDefault();
     };
     const contextmenu = (e) => e.preventDefault();
-    const mouseup = () => { dragging = false; panning = false; };
+    const mouseup = async () => {
+      if (this._partDrag) {
+        const d = this._partDrag;
+        this._partDrag = null;
+        // Translate the mesh's current offset into a new min-corner on the
+        // bed (baseMin + currentOffset) and hand it up to the app layer for
+        // persistence. We don't wait for the round-trip — the refresh after
+        // the API call rebuilds setParts with canonical geometry.
+        const newX = d.baseMinX + d.mesh.position.x;
+        const newY = d.baseMinZ + d.mesh.position.z;
+        if (typeof this.onPartDragEnd === 'function') {
+          try {
+            await this.onPartDragEnd(d.partId, newX, newY);
+          } catch (_) {
+            // surface the error through the caller — we already cleared the
+            // drag, so the mesh snaps back on the next refreshState().
+          }
+        }
+      }
+      dragging = false;
+      panning = false;
+    };
     const mousemove = (e) => {
+      if (this._partDrag) {
+        const p = pointerToBed(e);
+        if (!p) return;
+        const d = this._partDrag;
+        // Keep the grabbed point on the bed under the cursor: mesh offset
+        // shifts by (pointer - anchor) in bed-space coordinates.
+        let dx = p.x - d.anchorX;
+        let dz = p.z - d.anchorZ;
+        // Clamp so the visual preview matches the server-side clamp. bed X
+        // maps to Three.js X; bed Y maps to Three.js Z.
+        const [bx, , by] = this.bedSize;
+        dx = Math.max(-d.baseMinX, Math.min(bx - d.width - d.baseMinX, dx));
+        dz = Math.max(-d.baseMinZ, Math.min(by - d.depth - d.baseMinZ, dz));
+        d.mesh.position.set(dx, 0, dz);
+        return;
+      }
       if (!dragging && !panning) return;
       const dx = e.clientX - lastX;
       const dy = e.clientY - lastY;
       lastX = e.clientX;
       lastY = e.clientY;
       if (panning) {
-        // Pan in the camera's own X/Y plane so dragging feels 1:1 regardless
-        // of the current orbit angle. `_applyOrbit` sets the camera transform
-        // but leaves matrixWorld stale until the next render; force an update
-        // so the basis we read matches what the user is seeing.
         const panScale = this._orbit.radius * 0.0015;
         this.camera.updateMatrixWorld(true);
         this.camera.matrixWorld.extractBasis(panRight, panUp, panFwd);
         this._orbit.target.addScaledVector(panRight, -dx * panScale);
         this._orbit.target.addScaledVector(panUp, dy * panScale);
       } else {
-        // CAD-style: dragging the cursor RIGHT rotates the view RIGHT (camera
-        // orbits in the same direction the user drags).
-        this._orbit.azimuth -= dx * 0.008;
-        this._orbit.polar = Math.max(0.1, Math.min(Math.PI - 0.1, this._orbit.polar + dy * 0.008));
+        this._orbit.azimuth += dx * 0.008;
+        this._orbit.polar = Math.max(0.1, Math.min(Math.PI - 0.1, this._orbit.polar - dy * 0.008));
       }
       this._applyOrbit();
     };
@@ -207,6 +294,38 @@ export class PrinterScene {
     window.addEventListener('mouseup', mouseup);
     window.addEventListener('mousemove', mousemove);
     this._inputHandlers = { mousedown, contextmenu, wheel, mouseup, mousemove };
+  }
+
+  // Snap the orbit to a canonical camera pose. Users expect the same set of
+  // presets in any CAD-adjacent tool; we keep the names terse so the toolbar
+  // buttons fit in a row.
+  setView(name) {
+    const [x, , y] = this.bedSize;
+    this._orbit.target.set(x / 2, 0, y / 2);
+    this._orbit.radius = Math.max(x, y) * 1.6;
+    switch (name) {
+      case 'top':
+        // Looking straight down — polar → 0 collapses the camera onto +Y.
+        this._orbit.polar = 0.02;
+        this._orbit.azimuth = 0;
+        break;
+      case 'front':
+        // Looking along +Y (from the user's side of the bed toward the back).
+        this._orbit.polar = Math.PI / 2;
+        this._orbit.azimuth = Math.PI / 2;
+        break;
+      case 'right':
+        // Looking along +X from the right side of the bed.
+        this._orbit.polar = Math.PI / 2;
+        this._orbit.azimuth = 0;
+        break;
+      case 'iso':
+      default:
+        this._orbit.polar = Math.PI / 3;
+        this._orbit.azimuth = Math.PI / 4;
+        break;
+    }
+    this._applyOrbit();
   }
 
   makeHead() {
@@ -244,10 +363,69 @@ export class PrinterScene {
     line.position.set(x / 2, z / 2, y / 2);
     this.bedGroup.add(line);
 
+    // X/Y/Z reference gizmo at the (0,0,0) corner of the bed. Scaled to the
+    // bed so it stays visible on both Prusa-sized and tiny custom volumes.
+    // Colors map to the bed frame (red=X right, green=Y depth, blue=Z up).
+    this.bedGroup.add(this._buildAxesGizmo(Math.max(20, Math.min(40, Math.min(x, y) * 0.12))));
+
     // Recenter camera target on the bed
     this._orbit.target.set(x / 2, z / 4, y / 2);
     this._orbit.radius = Math.max(x, y) * 2;
     this._applyOrbit();
+  }
+
+  _buildAxesGizmo(size) {
+    const group = new THREE.Group();
+    group.name = 'axes-gizmo';
+    // Anchor at (0, 0, 0) in world — the front-left-bottom corner of the bed.
+    group.position.set(0, 0, 0);
+
+    // Directions use Three.js axes (y is up in this scene), but the labels and
+    // colors follow the backend/print-bed frame: +X=right, +Y=depth, +Z=up.
+    // So bed +Y maps to Three.js +Z, and bed +Z maps to Three.js +Y.
+    const head = size * 0.18;
+    const headW = size * 0.08;
+    const axes = [
+      { label: 'X', color: 0xff5050, dir: new THREE.Vector3(1, 0, 0) }, // bed X = three x
+      { label: 'Y', color: 0x50d060, dir: new THREE.Vector3(0, 0, 1) }, // bed Y = three z
+      { label: 'Z', color: 0x5094ff, dir: new THREE.Vector3(0, 1, 0) }, // bed Z = three y
+    ];
+    for (const a of axes) {
+      const arrow = new THREE.ArrowHelper(a.dir, new THREE.Vector3(0, 0, 0), size, a.color, head, headW);
+      // Thicker trunk than the default 1px.
+      if (arrow.line && arrow.line.material) arrow.line.material.linewidth = 2;
+      group.add(arrow);
+      const sprite = this._makeAxisLabel(a.label, a.color);
+      sprite.position.copy(a.dir).multiplyScalar(size + head * 0.8);
+      group.add(sprite);
+    }
+    return group;
+  }
+
+  _makeAxisLabel(text, color) {
+    // Canvas-texture sprite: cheap, stays screen-aligned, and scales naturally
+    // with camera distance because the sprite's world size is tied to bed mm.
+    const canvas = document.createElement('canvas');
+    canvas.width = 64;
+    canvas.height = 64;
+    const ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, 64, 64);
+    ctx.fillStyle = '#' + color.toString(16).padStart(6, '0');
+    ctx.font = 'bold 42px system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.shadowColor = 'rgba(0, 0, 0, 0.75)';
+    ctx.shadowBlur = 4;
+    ctx.fillText(text, 32, 34);
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.anisotropy = 4;
+    const material = new THREE.SpriteMaterial({ map: texture, transparent: true, depthTest: false });
+    const sprite = new THREE.Sprite(material);
+    sprite.scale.set(14, 14, 1);
+    // Draw on top of the arrow shaft so labels don't get occluded by the bed
+    // frame when the camera is low.
+    sprite.renderOrder = 10;
+    return sprite;
   }
 
   // parts: [{id, name, size, placement}], geometry dict keyed by id -> triangle list
@@ -276,6 +454,10 @@ export class PrinterScene {
       });
       const mesh = new THREE.Mesh(geom, mat);
       mesh.userData.partId = part.id;
+      // Store placement + triangle-space AABB so the part-drag handler can
+      // clamp to the bed without calling back into React state.
+      mesh.userData.placement = part.placement || null;
+      geom.computeBoundingBox();
       this.partsGroup.add(mesh);
     }
   }
@@ -434,16 +616,32 @@ export class PrinterScene {
       col[o + 3] = r; col[o + 4] = g; col[o + 5] = b;
     }
 
-    // Keep the source mesh visible at low opacity during simulation. Hiding
-    // it entirely made the running print look like a floating orange blob
-    // with no shape cue — the translucent mesh gives the eye a reference.
-    this.partsGroup.visible = true;
-    const meshOpacity = visibleSegs === 0 ? 0.35 : 0.12;
-    for (const child of this.partsGroup.children) {
-      if (child.material && child.material.opacity !== meshOpacity) {
-        child.material.opacity = meshOpacity;
-        child.material.transparent = true;
-        child.material.depthWrite = false;
+    // Before any simulation progress the source mesh is the scene — always
+    // show it at the upload-time opacity. Once the print starts advancing we
+    // honor the `partsSimVisible` flag (defaults off) so the printed filament
+    // reads clearly instead of being smeared by the translucent mesh.
+    const simActive = visibleSegs > 0;
+    if (simActive) {
+      this.partsGroup.visible = this._partsSimVisible !== false;
+      if (this.partsGroup.visible) {
+        const meshOpacity = 0.12;
+        for (const child of this.partsGroup.children) {
+          if (child.material && child.material.opacity !== meshOpacity) {
+            child.material.opacity = meshOpacity;
+            child.material.transparent = true;
+            child.material.depthWrite = false;
+          }
+        }
+      }
+    } else {
+      this.partsGroup.visible = true;
+      const meshOpacity = 0.35;
+      for (const child of this.partsGroup.children) {
+        if (child.material && child.material.opacity !== meshOpacity) {
+          child.material.opacity = meshOpacity;
+          child.material.transparent = true;
+          child.material.depthWrite = false;
+        }
       }
     }
 
@@ -474,6 +672,19 @@ export class PrinterScene {
 
   setToolpathVisible(visible) {
     this.toolpathGroup.visible = !!visible;
+  }
+
+  // Show/hide the translucent source meshes while the simulation is printing.
+  // Hidden by default so the printed filament isn't washed out; users can flip
+  // the checkbox in the Simulation panel to see the source geometry as a
+  // low-opacity ghost during the print.
+  setPartsSimVisible(visible) {
+    this._partsSimVisible = !!visible;
+    // Replay setCursor with the last known cursor so the opacity/visibility
+    // update lands immediately instead of waiting for the next sim tick.
+    if (this._moves && this._moves.length > 0) {
+      this.setCursor(this._lastCursor || 0);
+    }
   }
 
   // Frame the camera on the loaded parts (or bed, if none) so they fill ~90%

@@ -38,6 +38,52 @@ def make_binary_cube_stl(size: float = 10.0) -> bytes:
     return b"".join(out)
 
 
+def make_binary_t_overhang_stl(
+    stem_w: float = 4.0,
+    stem_h: float = 5.0,
+    cap_w: float = 10.0,
+    cap_h: float = 4.0,
+) -> bytes:
+    """T-shape STL: a narrow stem from z=0..stem_h and a wider cap on top
+    (z=stem_h..stem_h+cap_h). Useful for testing overhang/support logic —
+    the cap's underside that sticks out past the stem needs support.
+
+    Both halves are axis-aligned cuboids centered on (0,0) in XY. Writing
+    this out as 24 triangles (12 per cuboid) keeps the fixture minimal
+    while still exercising intersecting-mesh → overhang detection.
+    """
+    def cuboid_triangles(x0, y0, z0, x1, y1, z1):
+        # 6 faces × 2 tris
+        return [
+            [(x0, y0, z0), (x1, y0, z0), (x1, y1, z0)],  # -z
+            [(x0, y0, z0), (x1, y1, z0), (x0, y1, z0)],
+            [(x0, y0, z1), (x1, y1, z1), (x1, y0, z1)],  # +z
+            [(x0, y0, z1), (x0, y1, z1), (x1, y1, z1)],
+            [(x0, y0, z0), (x0, y1, z0), (x0, y1, z1)],  # -x
+            [(x0, y0, z0), (x0, y1, z1), (x0, y0, z1)],
+            [(x1, y0, z0), (x1, y0, z1), (x1, y1, z1)],  # +x
+            [(x1, y0, z0), (x1, y1, z1), (x1, y1, z0)],
+            [(x0, y0, z0), (x0, y0, z1), (x1, y0, z1)],  # -y
+            [(x0, y0, z0), (x1, y0, z1), (x1, y0, z0)],
+            [(x0, y1, z0), (x1, y1, z0), (x1, y1, z1)],  # +y
+            [(x0, y1, z0), (x1, y1, z1), (x0, y1, z1)],
+        ]
+
+    sw, sh = stem_w / 2.0, stem_h
+    cw, ch = cap_w / 2.0, cap_h
+    tris = cuboid_triangles(-sw, -sw, 0.0, sw, sw, sh)
+    tris += cuboid_triangles(-cw, -cw, sh, cw, cw, sh + ch)
+
+    header = b"binary t-overhang".ljust(80, b"\x00")
+    out = [header, struct.pack("<I", len(tris))]
+    for tri in tris:
+        out.append(struct.pack("<fff", 0.0, 0.0, 0.0))
+        for v in tri:
+            out.append(struct.pack("<fff", *v))
+        out.append(struct.pack("<H", 0))
+    return b"".join(out)
+
+
 def make_ascii_triangle_stl() -> bytes:
     """Minimal ASCII STL with a single triangle (degenerate vertically)."""
     return (

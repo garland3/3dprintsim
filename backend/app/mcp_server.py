@@ -71,6 +71,19 @@ def _viewer_public_url() -> str:
     return os.getenv("VIEWER_PUBLIC_URL", _backend_public_url())
 
 
+def _atlas_base_url() -> str:
+    """Origin that serves Atlas's `/mcp/files/download/...` endpoints.
+
+    Atlas hands the MCP tool either an absolute URL or a path-only string;
+    paths are resolved against this base. In production Atlas runs on a
+    different host than us, so set `ATLAS_BASE_URL` to its public origin
+    (e.g. `http://atlas:8000`). When unset we fall back to BACKEND_PUBLIC_URL,
+    which preserves the legacy "Atlas and the simulator share an origin"
+    assumption baked into the existing tests.
+    """
+    return os.getenv("ATLAS_BASE_URL") or _backend_public_url()
+
+
 def _normalize_atlas_url(filename: str) -> str:
     """Resolve an Atlas `filename` handoff to an absolute URL we can GET."""
     if filename.startswith("/"):
@@ -315,6 +328,34 @@ def build_mcp() -> FastMCP:
         return part.to_public()
 
     @mcp.tool
+    def rotate_part(part_id: str, axis: str, degrees: float, ctx: Context) -> dict:
+        """Rotate a part around a world axis ("x", "y", or "z") by `degrees`.
+
+        Rotations compose in the bed frame, so calling the tool twice with
+        the same axis simply adds up — handy for CAD-style "flip it 90°"
+        cleanups. Use `reset_part_rotation` to clear back to identity.
+        """
+        part = _svc(ctx).rotate_part(part_id, axis, degrees)
+        return part.to_public()
+
+    @mcp.tool
+    def reset_part_rotation(part_id: str, ctx: Context) -> dict:
+        """Clear all accumulated rotation on `part_id` back to the imported pose."""
+        part = _svc(ctx).rotate_part(part_id, "z", 0.0, reset=True)
+        return part.to_public()
+
+    @mcp.tool
+    def set_part_position(part_id: str, x: float, y: float, ctx: Context) -> dict:
+        """Place a part's min-corner at bed (x, y) in mm (clamped to the bed).
+
+        Use this to override auto-arrange for a single part — handy when the
+        shelf packer's default layout isn't what you want, or when you're
+        dragging a part in the UI.
+        """
+        part = _svc(ctx).set_part_position(part_id, x, y)
+        return part.to_public()
+
+    @mcp.tool
     def list_parts(ctx: Context) -> list[dict]:
         """List all loaded parts."""
         return [p.to_public() for p in _svc(ctx).parts.values()]
@@ -350,15 +391,48 @@ def build_mcp() -> FastMCP:
         bottom_layers: int = 3,
         nozzle_width_mm: float = 0.4,
         support_density: float = 0.25,
+        # Optional G-code / toolpath quality params. All optional so agents
+        # can slice with just the simulator defaults, or opt in to the full
+        # real-slicer behavior (retraction, fans, bridges, brim, ...) without
+        # having to specify every knob.
+        retract_mm: float | None = None,
+        retract_speed: float | None = None,
+        hotend_temp: float | None = None,
+        bed_temp: float | None = None,
+        fan_speed: int | None = None,
+        first_layer_fan: int | None = None,
+        bridge_fan: int | None = None,
+        bridge_speed_factor: float | None = None,
+        seam_position: str | None = None,
+        first_layer_height: float | None = None,
+        first_layer_speed: float | None = None,
+        brim_loops: int | None = None,
+        adaptive_layers: bool | None = None,
+        layer_height_min: float | None = None,
+        layer_height_max: float | None = None,
     ) -> dict:
         """Slice every loaded part and return a summary.
 
-        infill_density is 0..1 (fraction of the layer filled with sparse infill).
-        Top/bottom/overhang detection is raster-based: the first bottom_layers
-        and last top_layers of each part get solid infill, and any intermediate
-        layer with an overhang or hollow above/below also becomes solid.
-        support_density (0..1) controls how dense the auto-generated support
-        columns are — set to 0 to disable supports entirely.
+        Core params:
+          - infill_density is 0..1 (fraction of the layer filled with sparse infill).
+          - Top/bottom/overhang detection is raster-based: the first
+            bottom_layers and last top_layers of each part get solid infill,
+            and any intermediate layer with an overhang or hollow above/below
+            also becomes solid.
+          - support_density (0..1) controls how dense the auto-generated
+            support columns are — set to 0 to disable supports entirely.
+
+        Optional quality params (pass to tune the emitted G-code):
+          - retract_mm + retract_speed: filament rewind on travel.
+          - hotend_temp, bed_temp, fan_speed, first_layer_fan, bridge_fan:
+            thermal preamble + per-layer fan control.
+          - bridge_speed_factor (0-1): fraction of print_speed on bridge moves.
+          - seam_position: "auto" | "aligned" | "rear" | "nearest" — where
+            each perimeter starts.
+          - first_layer_height / first_layer_speed / brim_loops: bed-adhesion
+            helpers on layer 0.
+          - adaptive_layers (+ layer_height_min/_max): vary layer thickness
+            with local surface slope so gentle curves get thinner slices.
         """
         result = _svc(ctx).slice_all(
             layer_height=layer_height_mm,
@@ -368,6 +442,21 @@ def build_mcp() -> FastMCP:
             bottom_layers=bottom_layers,
             nozzle_width=nozzle_width_mm,
             support_density=support_density,
+            retract_mm=retract_mm,
+            retract_speed=retract_speed,
+            hotend_temp=hotend_temp,
+            bed_temp=bed_temp,
+            fan_speed=fan_speed,
+            first_layer_fan=first_layer_fan,
+            bridge_fan=bridge_fan,
+            bridge_speed_factor=bridge_speed_factor,
+            seam_position=seam_position,
+            first_layer_height=first_layer_height,
+            first_layer_speed=first_layer_speed,
+            brim_loops=brim_loops,
+            adaptive_layers=adaptive_layers,
+            layer_height_min=layer_height_min,
+            layer_height_max=layer_height_max,
         )
         return result.summary()
 

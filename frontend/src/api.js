@@ -109,6 +109,12 @@ export const api = {
   clearParts: () =>
     fetch('/api/parts/clear', { method: 'POST', headers: SESSION_HEADERS }).then(json),
   setPartScale: (id, scale) => postJSON(`/api/parts/${id}/scale`, { scale }),
+  rotatePart: (id, axis, degrees) =>
+    postJSON(`/api/parts/${id}/rotate`, { axis, degrees }),
+  resetPartRotation: (id) =>
+    postJSON(`/api/parts/${id}/rotate`, { axis: 'z', degrees: 0, reset: true }),
+  setPartPosition: (id, x, y) =>
+    postJSON(`/api/parts/${id}/position`, { x, y }),
   arrange: () =>
     fetch('/api/arrange', { method: 'POST', headers: SESSION_HEADERS }).then(json),
   slice: (params) => postJSON('/api/slice', params),

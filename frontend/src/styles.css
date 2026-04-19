@@ -78,7 +78,8 @@ button.secondary { background: #2a313a; color: #e6e7e9; }
 button.danger { background: #c04040; }
 button:disabled { opacity: 0.4; cursor: not-allowed; }
 
-.button-row { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+.button-row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+.button-row > button { margin: 0; }
 
 .parts-list { list-style: none; padding: 0; margin: 0; }
 .parts-list li {
@@ -96,13 +97,214 @@ button:disabled { opacity: 0.4; cursor: not-allowed; }
 .parts-list .meta { color: #8b9299; font-size: 11px; }
 .parts-list .part-scale {
   display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-top: 6px;
+}
+.parts-list .part-scale label { font-size: 11px; color: #8b9299; width: auto; }
+.parts-list .part-scale input { width: 70px; padding: 5px 6px; font-size: 12px; }
+.parts-list .part-scale button { padding: 5px 10px; font-size: 11px; min-width: 54px; min-height: 26px; }
+.parts-list .part-rotate {
+  display: flex;
   gap: 6px;
   align-items: center;
-  margin-top: 4px;
+  margin-top: 6px;
+  flex-wrap: wrap;
 }
-.parts-list .part-scale label { font-size: 11px; color: #8b9299; }
-.parts-list .part-scale input { width: 70px; padding: 4px 6px; font-size: 12px; }
-.parts-list .part-scale button { padding: 4px 8px; font-size: 11px; min-width: 48px; min-height: 22px; }
+.parts-list .part-rotate > label {
+  font-size: 11px;
+  color: #8b9299;
+  margin-right: 2px;
+  width: auto;
+}
+/* Group each axis's ± pair and keep a small visual separator between groups. */
+.parts-list .part-rotate .rotate-axis {
+  display: inline-flex;
+  gap: 3px;
+  padding-right: 4px;
+  border-right: 1px solid #22272d;
+  margin-right: 2px;
+}
+.parts-list .part-rotate .rotate-axis:last-of-type {
+  border-right: none;
+  padding-right: 0;
+  margin-right: 0;
+}
+.parts-list .part-rotate button {
+  padding: 4px 8px;
+  font-size: 11px;
+  min-width: 30px;
+  min-height: 24px;
+  font-family: ui-monospace, "SF Mono", Consolas, monospace;
+}
+.checkbox-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+}
+.checkbox-inline input[type="checkbox"] { accent-color: #2a82e4; }
+
+.step-row {
+  margin-top: 8px;
+  gap: 6px;
+}
+.step-row button {
+  font-size: 11px;
+  padding: 6px 10px;
+  min-width: 64px;
+  min-height: 26px;
+  font-family: ui-monospace, "SF Mono", Consolas, monospace;
+}
+
+/* Part-position editor row: pair of X/Y inputs + Set button. */
+.parts-list .part-pos {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  margin-top: 6px;
+}
+.parts-list .part-pos label { font-size: 11px; color: #8b9299; width: auto; margin-right: 2px; }
+.parts-list .part-pos input { width: 62px; padding: 5px 6px; font-size: 12px; }
+.parts-list .part-pos button { padding: 5px 10px; font-size: 11px; min-width: 44px; min-height: 26px; }
+.parts-list .part-name-row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.parts-list .part-name { font-weight: 600; }
+.parts-list li.out-of-bed { border-left: 3px solid #c04040; }
+
+/* Inline badges on part rows — danger (out-of-bed) and warn (mesh warnings). */
+.badge {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 9999px;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  cursor: help;
+}
+.badge.danger { background: #4a1515; color: #ff9090; border: 1px solid #6a2020; }
+.badge.warn   { background: #4a3a10; color: #ffd060; border: 1px solid #6a5020; }
+
+/* Collapsible sidebar sections. Kept visually close to the old h2 rhythm so
+   the layout stays calm when everything is expanded. */
+.panel { margin-top: 14px; }
+.panel .panel-header {
+  background: transparent;
+  color: #8b9299;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  font-size: 12px;
+  font-weight: 700;
+  padding: 4px 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  text-align: left;
+  cursor: pointer;
+  border: none;
+  border-bottom: 1px solid #1f242b;
+}
+.panel .panel-header:hover { color: #e6e7e9; }
+.panel .panel-title { flex: 1; }
+.panel .panel-aside { font-size: 11px; font-weight: 500; color: #5a6169; text-transform: none; letter-spacing: 0; }
+.panel .panel-body { padding-top: 8px; }
+.panel .caret { width: 10px; display: inline-block; }
+
+.sidebar-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.sidebar-head h1 { margin: 0; }
+.help-btn {
+  background: #1a1f25;
+  color: #e6e7e9;
+  border: 1px solid #2a313a;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border-radius: 13px;
+  font-weight: 700;
+  cursor: pointer;
+}
+.sidebar-footer {
+  margin-top: 20px;
+  padding-top: 12px;
+  border-top: 1px solid #1f242b;
+  text-align: right;
+}
+.link-btn {
+  background: transparent;
+  color: #7bb4ff;
+  padding: 2px 4px;
+  font-size: 11px;
+  font-weight: 500;
+  text-decoration: underline;
+}
+.link-btn:hover { color: #aad4ff; }
+
+/* Single floating pill that gathers the view presets + focus button. Narrow
+   enough to fit alongside the top-right overlay on typical window widths. */
+.toolbar-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px;
+  background: rgba(20, 24, 30, 0.85);
+  border: 1px solid #2a313a;
+  border-radius: 9999px;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.4);
+}
+.toolbar-pill .pill-btn {
+  background: transparent;
+  color: #c9ced4;
+  padding: 5px 10px;
+  font-size: 11px;
+  border-radius: 9999px;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  box-shadow: none;
+  min-width: 40px;
+}
+.toolbar-pill .pill-btn:hover { background: #2a313a; color: #fff; }
+.toolbar-pill .pill-divider {
+  width: 1px;
+  height: 16px;
+  background: #2a313a;
+  margin: 0 2px;
+}
+
+/* Keyboard-shortcut help overlay. */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+.modal {
+  background: #14181e;
+  border: 1px solid #2a313a;
+  border-radius: 8px;
+  padding: 20px 24px;
+  max-width: 440px;
+  width: calc(100% - 40px);
+  max-height: 85vh;
+  overflow-y: auto;
+  color: #e6e7e9;
+}
+.modal h3 { margin-top: 0; }
+.modal h4 { margin: 18px 0 6px; font-size: 12px; color: #8b9299; text-transform: uppercase; letter-spacing: 1px; }
+.modal dl {
+  display: grid;
+  grid-template-columns: 90px 1fr;
+  gap: 4px 16px;
+  margin: 8px 0 0;
+  font-size: 13px;
+}
+.modal dt { font-family: ui-monospace, "SF Mono", Consolas, monospace; color: #7bb4ff; }
+.modal ul { margin: 6px 0 0; padding-left: 18px; font-size: 13px; }
+.modal ul li { margin-bottom: 4px; }
+.modal button { margin-top: 16px; }
 .parts-list .remove {
   background: transparent;
   color: #c04040;
@@ -155,15 +357,20 @@ button { min-height: 32px; display: inline-flex; align-items: center; justify-co
 
 .overlay {
   position: absolute;
-  top: 12px;
+  bottom: 12px;
   right: 12px;
+  max-width: 60%;
   background: rgba(15, 18, 22, 0.85);
   border: 1px solid #1f242b;
   border-radius: 6px;
-  padding: 8px 12px;
-  font-size: 12px;
-  color: #8b9299;
+  padding: 6px 10px;
+  font-size: 11px;
+  color: #b7bcc2;
   font-family: ui-monospace, monospace;
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  white-space: nowrap;
 }
 
 .slider-row { display: flex; gap: 8px; align-items: center; }
@@ -209,9 +416,10 @@ button { min-height: 32px; display: inline-flex; align-items: center; justify-co
   left: 12px;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 8px;
+  align-items: flex-start;
 }
-.viewer-toolbar button { box-shadow: 0 2px 6px rgba(0,0,0,0.4); }
+.viewer-toolbar > button { box-shadow: 0 2px 6px rgba(0,0,0,0.4); }
 
 .legend {
   position: absolute;

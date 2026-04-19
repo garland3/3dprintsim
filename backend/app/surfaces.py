@@ -172,6 +172,65 @@ def compute_support_cells(
     return out
 
 
+def cluster_cells(cells: Iterable[Cell]) -> list[set[Cell]]:
+    """Group grid cells into 4-connected components.
+
+    Used by tree supports: each component becomes a single support "pillar"
+    with its own perimeter + sparse infill pattern instead of N disconnected
+    stubs, which match real-world support behavior better.
+    """
+    remaining: set[Cell] = set(cells)
+    clusters: list[set[Cell]] = []
+    while remaining:
+        seed = next(iter(remaining))
+        stack: list[Cell] = [seed]
+        group: set[Cell] = set()
+        while stack:
+            cell = stack.pop()
+            if cell not in remaining:
+                continue
+            remaining.discard(cell)
+            group.add(cell)
+            col, row = cell
+            for n in ((col + 1, row), (col - 1, row), (col, row + 1), (col, row - 1)):
+                if n in remaining:
+                    stack.append(n)
+        clusters.append(group)
+    return clusters
+
+
+def cells_to_boundary(cells: set[Cell], res: float) -> list[tuple[tuple[float, float], tuple[float, float]]]:
+    """Return the outer boundary edges of a cell cluster as line segments.
+
+    Each cell occupies the square [col*res, (col+1)*res] x [row*res, (row+1)*res].
+    An edge is an outer boundary if the neighbor cell on the other side is not
+    in the cluster. Callers that want a closed polyline should chain these
+    with the existing segment-chaining routines in slicer._chain_segments.
+    """
+    edges: list[tuple[tuple[float, float], tuple[float, float]]] = []
+    for (col, row) in cells:
+        x0 = col * res
+        y0 = row * res
+        x1 = x0 + res
+        y1 = y0 + res
+        if (col, row - 1) not in cells:
+            edges.append(((x0, y0), (x1, y0)))  # south
+        if (col + 1, row) not in cells:
+            edges.append(((x1, y0), (x1, y1)))  # east
+        if (col, row + 1) not in cells:
+            edges.append(((x1, y1), (x0, y1)))  # north
+        if (col - 1, row) not in cells:
+            edges.append(((x0, y1), (x0, y0)))  # west
+    return edges
+
+
+def cell_of(x: float, y: float, res: float = SUPPORT_RESOLUTION) -> Cell:
+    """Return the grid cell (col, row) containing the point (x, y)."""
+    import math
+
+    return (math.floor(x / res), math.floor(y / res))
+
+
 __all__ = [
     "Cell",
     "SUPPORT_RESOLUTION",
@@ -180,4 +239,7 @@ __all__ = [
     "top_surface_cells",
     "bottom_surface_cells",
     "compute_support_cells",
+    "cluster_cells",
+    "cells_to_boundary",
+    "cell_of",
 ]

@@ -20,7 +20,37 @@ from dataclasses import asdict, dataclass, field
 
 from .arrange import ArrangeError, ArrangeInput, Placement, arrange
 from .slicer import SliceResult, slice_meshes
-from .stl_loader import Mesh, parse_stl, scale_mesh, translate
+from .stl_loader import (
+    IDENTITY_ROTATION,
+    Matrix3,
+    Mesh,
+    axis_rotation_matrix,
+    multiply_matrix,
+    parse_stl,
+    rotate_mesh,
+    scale_mesh,
+    translate,
+    validate_mesh,
+)
+
+
+RotationMatrix = tuple[tuple[float, float, float], ...]
+
+
+def _identity() -> RotationMatrix:
+    return IDENTITY_ROTATION
+
+
+def _is_identity(m: Matrix3) -> bool:
+    # Tight tolerance — this is exact unless the user composes many non-90°
+    # rotations. Float drift at that point doesn't materially change what the
+    # renderer sees, so the short-circuit is still safe.
+    for i in range(3):
+        for j in range(3):
+            target = 1.0 if i == j else 0.0
+            if abs(m[i][j] - target) > 1e-9:
+                return False
+    return True
 
 
 # Prusa i3 MK3S+ default build volume.
@@ -33,14 +63,29 @@ class Part:
     name: str
     mesh: Mesh  # original, unplaced, unscaled mesh from the STL file
     scale: float = 1.0  # user-applied scale factor (e.g. 25.4 for inch → mm)
+    # World-axis rotation applied after scale, before translation to the bed.
+    # Stored as a 3x3 matrix so composing successive 90° clicks doesn't drift
+    # into gimbal-lock weirdness the way accumulated Euler angles would.
+    rotation: RotationMatrix = field(default_factory=_identity)
     placement: Placement | None = None
+    # Advisory warnings from the STL validator (degenerate triangles,
+    # non-manifold edges). The slicer still runs on parts with warnings,
+    # but the UI can surface them so a user knows why their output looks wrong.
+    warnings: list[str] = field(default_factory=list)
+
+    def has_rotation(self) -> bool:
+        return not _is_identity(self.rotation)
 
     def scaled_bounds(self) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
-        """AABB of the mesh after `scale` is applied, without touching triangles.
+        """AABB after scale + rotation have been applied.
 
-        This is the read-heavy path (state fetches, arrange, bed-fit checks),
-        so we skip the full triangle rescale whenever only the bounds matter.
+        Used by arrange/bed-fit; once the part is rotated its bed footprint
+        is the post-rotation AABB, not the raw scaled AABB. Slow path only
+        when a rotation is set — the pure-scale case stays bounds-only.
         """
+        if self.has_rotation():
+            transformed = self.transformed_mesh()
+            return transformed.min_xyz, transformed.max_xyz
         s = self.scale
         mn = self.mesh.min_xyz
         mx = self.mesh.max_xyz
@@ -53,18 +98,25 @@ class Part:
         return (mx[0] - mn[0], mx[1] - mn[1], mx[2] - mn[2])
 
     def scaled_mesh(self) -> Mesh:
-        """Return the mesh with the user's scale factor applied.
+        """Return the mesh with the user's scale factor applied (no rotation).
 
-        Rescales every triangle — call only when the full geometry is needed
-        (slicing, client-side rendering). For bounds/size prefer `scaled_bounds()`.
+        Rescales every triangle — call only when the full geometry is needed.
+        For bounds/size prefer `scaled_bounds()`.
         """
         if self.scale == 1.0:
             return self.mesh
         return scale_mesh(self.mesh, self.scale)
 
+    def transformed_mesh(self) -> Mesh:
+        """Scale + rotation applied, still in object frame (not translated)."""
+        mesh = self.scaled_mesh()
+        if not self.has_rotation():
+            return mesh
+        return rotate_mesh(mesh, self.rotation)
+
     def placed_mesh(self) -> Mesh:
-        """Return mesh scaled, then translated so its min corner sits at placement x,y and Z=0."""
-        base = self.scaled_mesh()
+        """Mesh scaled, rotated, then translated so min-corner is at (placement.x, placement.y, 0)."""
+        base = self.transformed_mesh()
         mn = base.min_xyz
         dx = -mn[0]
         dy = -mn[1]
@@ -81,7 +133,9 @@ class Part:
             "name": self.name,
             "size": list(size),
             "scale": self.scale,
+            "rotation": [list(row) for row in self.rotation],
             "triangle_count": len(self.mesh.triangles),
+            "warnings": list(self.warnings),
             "placement": (
                 {"x": self.placement.x, "y": self.placement.y, "rotation_deg": self.placement.rotation_deg}
                 if self.placement
@@ -138,8 +192,11 @@ class PrinterService:
         if scale <= 0:
             raise ValueError(f"scale must be positive, got {scale}")
         mesh = parse_stl(data)
+        warnings = validate_mesh(mesh)
         part_id = uuid.uuid4().hex[:8]
-        part = Part(id=part_id, name=name, mesh=mesh, scale=float(scale))
+        part = Part(
+            id=part_id, name=name, mesh=mesh, scale=float(scale), warnings=warnings
+        )
         with self._lock:
             self.parts[part_id] = part
             # Place the new part on the bed immediately so it's visible without a
@@ -210,6 +267,75 @@ class PrinterService:
             self._invalidate_slice()
             return part
 
+    def rotate_part(
+        self, part_id: str, axis: str, degrees: float, *, reset: bool = False
+    ) -> Part:
+        """Apply a world-axis rotation to a part.
+
+        Passing `reset=True` clears the rotation back to identity and ignores
+        `axis`/`degrees`. Otherwise the named world axis is rotated by
+        `degrees` and pre-multiplied onto the existing orientation so
+        successive clicks accumulate in the bed frame (not the part frame —
+        the user wants "press +Z again to keep spinning around bed-up").
+        """
+        with self._lock:
+            if part_id not in self.parts:
+                raise KeyError(f"unknown part {part_id}")
+            part = self.parts[part_id]
+            if reset:
+                part.rotation = IDENTITY_ROTATION
+            else:
+                rot = axis_rotation_matrix(axis, float(degrees))
+                part.rotation = multiply_matrix(rot, part.rotation)
+            # Footprint just changed — re-pack the bed (or re-center if this
+            # is the only part). Fall back to "unplaced" if the rotation
+            # makes the part no longer fit.
+            if len(self.parts) == 1:
+                try:
+                    part.placement = self._center_placement(part)
+                except ArrangeError:
+                    part.placement = None
+            else:
+                try:
+                    self._auto_arrange_locked()
+                except ArrangeError:
+                    part.placement = None
+            self._invalidate_slice()
+            return part
+
+    def set_part_position(self, part_id: str, x: float, y: float) -> Part:
+        """Manually place `part_id` so its min-corner sits at bed (x, y).
+
+        Clamped to `[0, bed - size]` so a user can't drag a part off the
+        plate. Margin is intentionally NOT enforced here — we prefer to let
+        the user get close to the edge on purpose and surface any slice-time
+        failure through the existing 409 path.
+        """
+        with self._lock:
+            if part_id not in self.parts:
+                raise KeyError(f"unknown part {part_id}")
+            part = self.parts[part_id]
+            w, d, _ = part.scaled_size()
+            bx, by, _ = self.bed_size
+            if w > bx or d > by:
+                raise ValueError(
+                    f"part {part_id} ({w:.1f}x{d:.1f}) larger than bed "
+                    f"{bx:.0f}x{by:.0f}"
+                )
+            clamped_x = max(0.0, min(bx - w, float(x)))
+            clamped_y = max(0.0, min(by - d, float(y)))
+            prev_rotation = (
+                part.placement.rotation_deg if part.placement is not None else 0.0
+            )
+            part.placement = Placement(
+                part_id=part_id,
+                x=clamped_x,
+                y=clamped_y,
+                rotation_deg=prev_rotation,
+            )
+            self._invalidate_slice()
+            return part
+
     def remove_part(self, part_id: str) -> None:
         with self._lock:
             if part_id not in self.parts:
@@ -252,6 +378,24 @@ class PrinterService:
         bottom_layers: int = 3,
         nozzle_width: float = 0.4,
         support_density: float = 0.25,
+        *,
+        # Optional quality/print params (all default to the slicer's own
+        # defaults so existing callers don't need to change).
+        retract_mm: float | None = None,
+        retract_speed: float | None = None,
+        hotend_temp: float | None = None,
+        bed_temp: float | None = None,
+        fan_speed: int | None = None,
+        first_layer_fan: int | None = None,
+        bridge_fan: int | None = None,
+        bridge_speed_factor: float | None = None,
+        seam_position: str | None = None,
+        first_layer_height: float | None = None,
+        first_layer_speed: float | None = None,
+        brim_loops: int | None = None,
+        adaptive_layers: bool | None = None,
+        layer_height_min: float | None = None,
+        layer_height_max: float | None = None,
     ) -> SliceResult:
         with self._lock:
             if not self.parts:
@@ -261,16 +405,38 @@ class PrinterService:
                 # Auto-arrange first so slicing always works against real bed positions.
                 self.auto_arrange()
             meshes = [p.placed_mesh() for p in self.parts.values()]
-            result = slice_meshes(
-                meshes,
-                layer_height=layer_height,
-                perimeters=perimeters,
-                infill_density=infill_density,
-                top_layers=top_layers,
-                bottom_layers=bottom_layers,
-                nozzle_width=nozzle_width,
-                support_density=support_density,
-            )
+            kwargs: dict = {
+                "layer_height": layer_height,
+                "perimeters": perimeters,
+                "infill_density": infill_density,
+                "top_layers": top_layers,
+                "bottom_layers": bottom_layers,
+                "nozzle_width": nozzle_width,
+                "support_density": support_density,
+            }
+            # Only forward non-None optionals so the slicer's defaults apply
+            # for the common case and unit tests don't need a giant kwargs dict.
+            opt_map: dict[str, object] = {
+                "retract_mm": retract_mm,
+                "retract_speed": retract_speed,
+                "hotend_temp": hotend_temp,
+                "bed_temp": bed_temp,
+                "fan_speed": fan_speed,
+                "first_layer_fan": first_layer_fan,
+                "bridge_fan": bridge_fan,
+                "bridge_speed_factor": bridge_speed_factor,
+                "seam_position": seam_position,
+                "first_layer_height": first_layer_height,
+                "first_layer_speed": first_layer_speed,
+                "brim_loops": brim_loops,
+                "adaptive_layers": adaptive_layers,
+                "layer_height_min": layer_height_min,
+                "layer_height_max": layer_height_max,
+            }
+            for k, v in opt_map.items():
+                if v is not None:
+                    kwargs[k] = v
+            result = slice_meshes(meshes, **kwargs)
             self.slice_result = result
             self.simulation = Simulation(running=False, cursor=0, speed=self.simulation.speed)
             self._bump_revision()
