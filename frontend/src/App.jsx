@@ -87,14 +87,16 @@ export default function App() {
     return () => window.removeEventListener('keydown', onKey);
   }, [focusView]);
 
-  // Poll the backend for one-shot viewer requests (e.g. MCP-initiated focus).
-  // Two-second cadence is fine: this is a developer tool and the polls are
-  // tiny. Any increase over the last known counter triggers focus. The first
-  // observed value is compared against 0 (the service's initial state), so
-  // an MCP call that lands before the UI mounts is still honored.
+  // Poll the backend for one-shot viewer requests (camera focus) and for
+  // server-side state revisions. The latter is how MCP-driven mutations
+  // (LLM uploads a part, slices, advances the simulation) reach the UI —
+  // the backend bumps state_revision on every mutation, and we re-fetch
+  // /api/state whenever it advances past what we last rendered. Two-second
+  // cadence is fine: this is a developer tool and the polls are tiny.
   useEffect(() => {
     let cancelled = false;
     let lastFocus = 0;
+    let lastRevision = -1;  // -1 so the first tick seeds without a refetch
     const tick = async () => {
       try {
         const r = await api.viewerRequests();
@@ -103,6 +105,15 @@ export default function App() {
           focusView();
           lastFocus = r.focus_request;
         }
+        const rev = typeof r.state_revision === 'number' ? r.state_revision : 0;
+        if (lastRevision < 0) {
+          // First successful tick — accept whatever the server is at without
+          // double-fetching, since the mount-time refreshState() already ran.
+          lastRevision = rev;
+        } else if (rev > lastRevision) {
+          lastRevision = rev;
+          await refreshState();
+        }
       } catch {
         // intentional swallow: backend hiccups shouldn't crash the UI
       }
@@ -110,7 +121,7 @@ export default function App() {
     tick();
     const id = setInterval(tick, 2000);
     return () => { cancelled = true; clearInterval(id); };
-  }, [focusView]);
+  }, [focusView, refreshState]);
 
   // Keep the scene's toolpath visibility in sync with the sidebar toggle.
   useEffect(() => {

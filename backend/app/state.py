@@ -116,6 +116,11 @@ class PrinterService:
         # action (currently: camera focus). The counter is preserved across
         # slice invalidation on purpose — it's a UI signal, not print state.
         self.focus_request: int = 0
+        # Monotonic counter bumped on every mutation. The browser polls
+        # /api/viewer/requests on a 2s tick and re-fetches /api/state when
+        # this advances, so MCP-driven changes (LLM uploads a part, slices,
+        # steps the simulation) appear in the UI without the user clicking.
+        self.state_revision: int = 0
 
     # --- printer config ---
 
@@ -268,6 +273,7 @@ class PrinterService:
             )
             self.slice_result = result
             self.simulation = Simulation(running=False, cursor=0, speed=self.simulation.speed)
+            self._bump_revision()
             return result
 
     # --- simulation ---
@@ -281,6 +287,7 @@ class PrinterService:
                 cursor=0,
                 speed=float(speed) if speed is not None else self.simulation.speed,
             )
+            self._bump_revision()
             return self.simulation
 
     def step_simulation(self, steps: int = 1) -> Simulation:
@@ -291,6 +298,7 @@ class PrinterService:
             self.simulation.cursor = min(total, self.simulation.cursor + max(1, int(steps)))
             if self.simulation.cursor >= total:
                 self.simulation.running = False
+            self._bump_revision()
             return self.simulation
 
     def set_simulation_cursor(self, cursor: int) -> Simulation:
@@ -300,6 +308,7 @@ class PrinterService:
             total = len(self.slice_result.moves)
             self.simulation.cursor = max(0, min(total, int(cursor)))
             self.simulation.running = self.simulation.cursor < total
+            self._bump_revision()
             return self.simulation
 
     def get_simulation_frame(self) -> dict:
@@ -354,7 +363,10 @@ class PrinterService:
 
     def get_viewer_requests(self) -> dict:
         with self._lock:
-            return {"focus_request": self.focus_request}
+            return {
+                "focus_request": self.focus_request,
+                "state_revision": self.state_revision,
+            }
 
     def get_part_geometry(self, part_id: str) -> dict:
         with self._lock:
@@ -373,6 +385,13 @@ class PrinterService:
     def _invalidate_slice(self) -> None:
         self.slice_result = None
         self.simulation = Simulation(running=False, cursor=0, speed=self.simulation.speed)
+        self._bump_revision()
+
+    def _bump_revision(self) -> None:
+        # Caller must already hold self._lock — every mutation goes through
+        # a `with self._lock:` block, so bumping inside that critical section
+        # keeps the counter and the state it advertises in lockstep.
+        self.state_revision += 1
 
 
 DEFAULT_SESSION_ID = "default"
