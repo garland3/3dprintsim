@@ -23,7 +23,12 @@ from .fixtures import make_binary_cube_stl
 
 
 @pytest.fixture(autouse=True)
-def fresh_service():
+def fresh_service(monkeypatch):
+    # Tests bake in the legacy `http://localhost:8000` default — clear any
+    # operator env vars that the project's `.env` (loaded at `app.main`
+    # import time) may have leaked in, so the suite stays deterministic.
+    for var in ("BACKEND_PUBLIC_URL", "BACKEND_PORT", "ATLAS_BASE_URL"):
+        monkeypatch.delenv(var, raising=False)
     reset_service()
     yield
     reset_service()

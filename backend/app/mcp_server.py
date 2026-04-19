@@ -39,8 +39,26 @@ _ATLAS_MAX_BYTES = 200 * 1024 * 1024  # 200 MiB
 
 def _backend_public_url() -> str:
     """Resolved at call time so tests can flip BACKEND_PUBLIC_URL per-case
-    without having to reload this module."""
-    return os.getenv("BACKEND_PUBLIC_URL", "http://localhost:8000")
+    without having to reload this module. Falls back to BACKEND_PORT from
+    the .env so the iframe URL matches the port the server actually binds."""
+    explicit = os.getenv("BACKEND_PUBLIC_URL")
+    if explicit:
+        return explicit
+    port = os.getenv("BACKEND_PORT", "8000")
+    return f"http://localhost:{port}"
+
+
+def _atlas_base_url() -> str:
+    """Origin that serves Atlas's `/mcp/files/download/...` endpoints.
+
+    Atlas hands the MCP tool either an absolute URL or a path-only string;
+    paths are resolved against this base. In production Atlas runs on a
+    different host than us, so set `ATLAS_BASE_URL` to its public origin
+    (e.g. `http://atlas:8000`). When unset we fall back to BACKEND_PUBLIC_URL,
+    which preserves the legacy "Atlas and the simulator share an origin"
+    assumption baked into the existing tests.
+    """
+    return os.getenv("ATLAS_BASE_URL") or _backend_public_url()
 
 
 def _viewer_public_url() -> str:
@@ -56,27 +74,28 @@ def _viewer_public_url() -> str:
 def _normalize_atlas_url(filename: str) -> str:
     """Resolve an Atlas `filename` handoff to an absolute URL we can GET."""
     if filename.startswith("/"):
-        return urljoin(_backend_public_url(), filename)
+        return urljoin(_atlas_base_url(), filename)
     return filename
 
 
 def _allowed_hosts() -> set[str]:
     """Hosts the Atlas downloader is willing to talk to.
 
-    Always includes the configured backend's host (that's where relative
-    `/mcp/files/download/...` paths resolve), plus any operator-supplied
-    ATLAS_ALLOWED_HOSTS entries. Anything else is rejected up front so a
-    hostile prompt can't coerce the server into SSRF requests to cloud
-    metadata, RFC1918 services, or unrelated third-party hosts.
+    Always includes the configured backend's host plus the Atlas base host
+    (so relative `/mcp/files/download/...` paths resolve cleanly), plus any
+    operator-supplied ATLAS_ALLOWED_HOSTS entries. Anything else is rejected
+    up front so a hostile prompt can't coerce the server into SSRF requests
+    to cloud metadata, RFC1918 services, or unrelated third-party hosts.
     """
     hosts: set[str] = {
         h.strip().lower()
         for h in os.getenv("ATLAS_ALLOWED_HOSTS", "").split(",")
         if h.strip()
     }
-    backend = urlparse(_backend_public_url()).netloc.lower()
-    if backend:
-        hosts.add(backend)
+    for url in (_backend_public_url(), _atlas_base_url()):
+        netloc = urlparse(url).netloc.lower()
+        if netloc:
+            hosts.add(netloc)
     return hosts
 
 
@@ -100,11 +119,35 @@ def _reject_ssrf(url: str) -> None:
     if netloc not in allowed and host not in allowed:
         raise ValueError(
             f"Atlas host {netloc!r} is not in the allowlist; "
-            "set ATLAS_ALLOWED_HOSTS or BACKEND_PUBLIC_URL to permit it"
+            "set ATLAS_ALLOWED_HOSTS, ATLAS_BASE_URL, or BACKEND_PUBLIC_URL "
+            "to permit it"
         )
     # Skip the private-IP check for loopback since the default backend runs
     # on localhost and legitimately resolves to 127.0.0.1/::1.
     if host in ("localhost", "127.0.0.1", "::1"):
+        return
+    # Also skip for hosts the operator explicitly configured as the backend
+    # or Atlas origin — those are deliberate trust decisions, e.g. pointing
+    # at `host.containers.internal` (resolves to a private IP) so a podman
+    # container can reach Atlas on the host. The wider ATLAS_ALLOWED_HOSTS
+    # list still gets the private-IP guard since it's meant for public peers.
+    #
+    # Match by both `netloc` (host:port) AND `hostname` so an operator who
+    # set ATLAS_BASE_URL=http://atlas:8000 still bypasses the IP guard for
+    # a signed URL Atlas hands back on a different/implicit port (e.g.
+    # `http://atlas/file` or `http://atlas:443/file`). The operator's trust
+    # decision is "I authorize this host", not "I authorize this host:port".
+    operator_netlocs: set[str] = set()
+    operator_hostnames: set[str] = set()
+    for u in (os.getenv("ATLAS_BASE_URL"), os.getenv("BACKEND_PUBLIC_URL")):
+        if not u:
+            continue
+        parsed_op = urlparse(u)
+        if parsed_op.netloc:
+            operator_netlocs.add(parsed_op.netloc.lower())
+        if parsed_op.hostname:
+            operator_hostnames.add(parsed_op.hostname.lower())
+    if netloc in operator_netlocs or host in operator_hostnames:
         return
     try:
         infos = socket.getaddrinfo(host, None)
@@ -207,8 +250,9 @@ def build_mcp() -> FastMCP:
         """Upload an STL that the Atlas host has already stashed in its file
         vault. `filename` is the secure download URL supplied by Atlas — it
         may be an absolute URL or a relative path (e.g.
-        `/mcp/files/download/abc123?token=xyz`); either is resolved against
-        the backend's public base URL before the GET.
+        `/mcp/files/download/abc123?token=xyz`); relative paths are resolved
+        against `ATLAS_BASE_URL` (Atlas's public origin), or
+        `BACKEND_PUBLIC_URL` if the former is unset.
 
         Use this when the user drops an STL into the chat rather than asking
         the model to base64-encode the file inline (which blows up both the

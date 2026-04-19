@@ -87,14 +87,22 @@ export default function App() {
     return () => window.removeEventListener('keydown', onKey);
   }, [focusView]);
 
-  // Poll the backend for one-shot viewer requests (e.g. MCP-initiated focus).
-  // Two-second cadence is fine: this is a developer tool and the polls are
-  // tiny. Any increase over the last known counter triggers focus. The first
-  // observed value is compared against 0 (the service's initial state), so
-  // an MCP call that lands before the UI mounts is still honored.
+  // Held in a ref so the polling effect below can call the latest
+  // `refreshState` without putting it in the dep array — `refreshState`
+  // is declared with `const` further down the component body, and listing
+  // it in deps here would hit the temporal dead zone at render time.
+  const refreshStateRef = useRef(null);
+
+  // Poll the backend for one-shot viewer requests (camera focus) and for
+  // server-side state revisions. The latter is how MCP-driven mutations
+  // (LLM uploads a part, slices, advances the simulation) reach the UI —
+  // the backend bumps state_revision on every mutation, and we re-fetch
+  // /api/state whenever it advances past what we last rendered. Two-second
+  // cadence is fine: this is a developer tool and the polls are tiny.
   useEffect(() => {
     let cancelled = false;
     let lastFocus = 0;
+    let lastRevision = -1;  // -1 so the first tick seeds without a refetch
     const tick = async () => {
       try {
         const r = await api.viewerRequests();
@@ -102,6 +110,20 @@ export default function App() {
         if (r.focus_request > lastFocus) {
           focusView();
           lastFocus = r.focus_request;
+        }
+        const rev = typeof r.state_revision === 'number' ? r.state_revision : 0;
+        if (lastRevision < 0) {
+          // First successful tick — accept whatever the server is at without
+          // double-fetching, since the mount-time refreshState() already ran.
+          lastRevision = rev;
+        } else if (rev > lastRevision) {
+          lastRevision = rev;
+          // adoptSimRunning=false: never let a poll-driven refresh flip the
+          // local sim into running=true, otherwise an LLM `start_simulation`
+          // would kick off the client RAF loop, which would race with the
+          // LLM's explicit step calls and end up posting setCursor(total)
+          // back to the backend, overriding tool-controlled progress.
+          await refreshStateRef.current?.({ adoptSimRunning: false });
         }
       } catch {
         // intentional swallow: backend hiccups shouldn't crash the UI
@@ -117,7 +139,12 @@ export default function App() {
     if (sceneRef.current) sceneRef.current.setToolpathVisible(showToolpath);
   }, [showToolpath]);
 
-  const refreshState = useCallback(async () => {
+  // `adoptSimRunning` defaults to true so existing user-action callers
+  // (upload, slice, sim controls) keep their behavior. The polling path
+  // passes `false` so an LLM-driven `start_simulation` can't flip the
+  // local sim into running=true and start the client RAF loop racing the
+  // tool's own step calls.
+  const refreshState = useCallback(async ({ adoptSimRunning = true } = {}) => {
     try {
       const st = await api.state();
       setBed({ x: st.bed_size[0], y: st.bed_size[1], z: st.bed_size[2] });
@@ -126,8 +153,12 @@ export default function App() {
       setSim((s) => ({
         ...s,
         // Don't let a backend refresh clobber a client-side simulation in
-        // flight; the local RAF loop is authoritative while running.
-        running: s.running ? s.running : st.simulation.running,
+        // flight; the local RAF loop is authoritative while running. And
+        // for poll-driven refreshes, never propagate backend running=true
+        // either — see the polling effect comment for the rationale.
+        running: s.running
+          ? s.running
+          : (adoptSimRunning ? st.simulation.running : false),
         cursor: s.running ? s.cursor : st.simulation.cursor,
         total: st.simulation.total_moves,
         speed: st.simulation.speed,
@@ -137,6 +168,12 @@ export default function App() {
       setError(String(e));
     }
   }, []);
+
+  // Keep the ref the polling effect reads in sync with the latest
+  // `refreshState`. `refreshState` is a stable useCallback (deps: []), so
+  // in practice this only runs once, but doing it via effect is what makes
+  // the forward-reference safe across future deps changes.
+  useEffect(() => { refreshStateRef.current = refreshState; }, [refreshState]);
 
   useEffect(() => { refreshState(); }, [refreshState]);
 

@@ -151,8 +151,11 @@ The `atlas_upload` tool fetches that URL, feeds the bytes into the same
 `add_part_from_bytes()` path `upload_stl` uses, and returns the new part's
 metadata. The URL may be absolute (`https://atlas.example.com/mcp/files/...`)
 or a relative path (`/mcp/files/download/abc123?token=xyz`); relative paths
-are resolved against the `BACKEND_PUBLIC_URL` env var (defaults to
-`http://localhost:8000`).
+are resolved against the `ATLAS_BASE_URL` env var, or `BACKEND_PUBLIC_URL`
+if `ATLAS_BASE_URL` is unset (legacy single-origin setups). When the
+simulator and Atlas run in different containers, `ATLAS_BASE_URL` must
+point at Atlas's reachable public origin, otherwise the GET lands on the
+simulator itself and 404s.
 
 ```python
 await client.call_tool("atlas_upload", {
@@ -173,8 +176,9 @@ The tool is reachable from any MCP client, so every URL is validated before
 a socket is opened:
 
 - Scheme must be `http` or `https`.
-- Host must match the backend's (`BACKEND_PUBLIC_URL`) origin, or an entry
-  in `ATLAS_ALLOWED_HOSTS` (comma-separated `host[:port]` list).
+- Host must match the backend's (`BACKEND_PUBLIC_URL`) origin, the Atlas
+  origin (`ATLAS_BASE_URL`), or an entry in `ATLAS_ALLOWED_HOSTS`
+  (comma-separated `host[:port]` list).
 - For non-loopback hosts the resolved IP must be public — requests whose
   DNS lands on private, loopback, link-local, or reserved ranges are
   rejected with a clear error.

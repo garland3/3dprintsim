@@ -428,16 +428,21 @@ def test_mcp_tools_exposed():
 
 
 def test_viewer_focus_request_is_monotonic(client: TestClient):
-    """POSTing /api/viewer/focus increments the counter the UI polls."""
+    """POSTing /api/viewer/focus increments the counter the UI polls.
+
+    Focus is a transient UI signal, so it must NOT bump state_revision —
+    otherwise every camera focus would trigger a needless /api/state refetch.
+    """
     initial = client.get("/api/viewer/requests").json()
-    assert initial == {"focus_request": 0}
+    assert initial == {"focus_request": 0, "state_revision": 0}
 
     r = client.post("/api/viewer/focus").json()
     assert r["focus_request"] == 1
     r = client.post("/api/viewer/focus").json()
     assert r["focus_request"] == 2
 
-    assert client.get("/api/viewer/requests").json() == {"focus_request": 2}
+    final = client.get("/api/viewer/requests").json()
+    assert final == {"focus_request": 2, "state_revision": 0}
 
 
 def test_mcp_focus_viewer_increments_counter(client: TestClient):
@@ -459,7 +464,63 @@ def test_mcp_focus_viewer_increments_counter(client: TestClient):
     assert a_data["focus_request"] == 1
     assert b_data["focus_request"] == 2
     # And the HTTP polling endpoint sees the same value.
-    assert client.get("/api/viewer/requests").json() == {"focus_request": 2}
+    final = client.get("/api/viewer/requests").json()
+    assert final == {"focus_request": 2, "state_revision": 0}
+
+
+def test_state_revision_bumps_on_mutations(client: TestClient):
+    """The browser polls /api/viewer/requests every 2s and re-fetches
+    /api/state whenever state_revision advances. So every backend mutation —
+    bed resize, part upload, slice, simulation step — must bump it,
+    otherwise an MCP-driven change is invisible in the UI.
+    """
+    initial = client.get("/api/viewer/requests").json()
+    assert initial["state_revision"] == 0
+
+    # bed resize → bump
+    client.post("/api/bed", json={"x": 200, "y": 200, "z": 200})
+    after_bed = client.get("/api/viewer/requests").json()["state_revision"]
+    assert after_bed > 0
+
+    # part upload → bump
+    upload_cube(client, size=10.0)
+    after_upload = client.get("/api/viewer/requests").json()["state_revision"]
+    assert after_upload > after_bed
+
+    # slice → bump
+    client.post("/api/slice", json={})
+    after_slice = client.get("/api/viewer/requests").json()["state_revision"]
+    assert after_slice > after_upload
+
+    # simulation step → bump
+    client.post("/api/simulation/start", json={})
+    after_start = client.get("/api/viewer/requests").json()["state_revision"]
+    assert after_start > after_slice
+    client.post("/api/simulation/step", json={"steps": 1})
+    after_step = client.get("/api/viewer/requests").json()["state_revision"]
+    assert after_step > after_start
+
+    # focus is a UI signal, NOT a mutation — revision must stay put.
+    client.post("/api/viewer/focus")
+    after_focus = client.get("/api/viewer/requests").json()
+    assert after_focus["state_revision"] == after_step
+    assert after_focus["focus_request"] == 1
+
+
+def test_state_revision_isolated_per_session(client: TestClient):
+    """Two MCP sessions must each see their own revision counter — otherwise
+    one Atlas tab's mutations would noisily refresh another tab's UI."""
+    headers_a = {"X-Session-Id": "rev-a"}
+    headers_b = {"X-Session-Id": "rev-b"}
+
+    # Each session starts at 0.
+    assert client.get("/api/viewer/requests", headers=headers_a).json()["state_revision"] == 0
+    assert client.get("/api/viewer/requests", headers=headers_b).json()["state_revision"] == 0
+
+    # Mutate session A — only A's counter moves.
+    client.post("/api/bed", json={"x": 200, "y": 200, "z": 200}, headers=headers_a)
+    assert client.get("/api/viewer/requests", headers=headers_a).json()["state_revision"] > 0
+    assert client.get("/api/viewer/requests", headers=headers_b).json()["state_revision"] == 0
 
 
 def test_mcp_upload_base64_roundtrip(client: TestClient):
