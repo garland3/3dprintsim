@@ -131,12 +131,23 @@ def _reject_ssrf(url: str) -> None:
     # at `host.containers.internal` (resolves to a private IP) so a podman
     # container can reach Atlas on the host. The wider ATLAS_ALLOWED_HOSTS
     # list still gets the private-IP guard since it's meant for public peers.
-    operator_hosts = {
-        urlparse(u).netloc.lower()
-        for u in (os.getenv("ATLAS_BASE_URL"), os.getenv("BACKEND_PUBLIC_URL"))
-        if u
-    }
-    if netloc in operator_hosts:
+    #
+    # Match by both `netloc` (host:port) AND `hostname` so an operator who
+    # set ATLAS_BASE_URL=http://atlas:8000 still bypasses the IP guard for
+    # a signed URL Atlas hands back on a different/implicit port (e.g.
+    # `http://atlas/file` or `http://atlas:443/file`). The operator's trust
+    # decision is "I authorize this host", not "I authorize this host:port".
+    operator_netlocs: set[str] = set()
+    operator_hostnames: set[str] = set()
+    for u in (os.getenv("ATLAS_BASE_URL"), os.getenv("BACKEND_PUBLIC_URL")):
+        if not u:
+            continue
+        parsed_op = urlparse(u)
+        if parsed_op.netloc:
+            operator_netlocs.add(parsed_op.netloc.lower())
+        if parsed_op.hostname:
+            operator_hostnames.add(parsed_op.hostname.lower())
+    if netloc in operator_netlocs or host in operator_hostnames:
         return
     try:
         infos = socket.getaddrinfo(host, None)
