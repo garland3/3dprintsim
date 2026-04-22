@@ -642,14 +642,16 @@ export default function App() {
 
   // Factory mode takes over the whole window — its sidebar + grid own the
   // layout. Rendered unconditionally of the single-printer state so the
-  // PrinterScene effect above keeps the single-printer scene warm and the
-  // user's "back" button returns instantly without a re-init.
-  if (factoryMode && factoryEnabled) {
-    return <FactoryView onBack={() => setFactoryMode(false)} />;
-  }
+  // PrinterScene effect above keeps the single-printer canvas mounted (just
+  // CSS-hidden); otherwise unmount/remount would leave `sceneRef` pointing
+  // at a detached canvas and the user's "back" button returns to a blank
+  // viewport.
+  const inFactory = factoryMode && factoryEnabled;
 
   return (
-    <div className="app">
+    <>
+    {inFactory ? <FactoryView onBack={() => setFactoryMode(false)} /> : null}
+    <div className="app" style={inFactory ? { display: 'none' } : undefined}>
       <aside className="sidebar" data-testid="sidebar">
         <div className="sidebar-head">
           <h1>3D Print Sim</h1>
@@ -1164,5 +1166,6 @@ export default function App() {
         </div>
       )}
     </div>
+    </>
   );
 }

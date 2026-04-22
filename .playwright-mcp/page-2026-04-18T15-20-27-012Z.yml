@@ -1,0 +1,97 @@
+- generic [ref=e3]:
+  - complementary [ref=e4]:
+    - generic [ref=e5]:
+      - heading "3D Print Sim" [level=1] [ref=e6]
+      - button "?" [ref=e7] [cursor=pointer]
+    - generic [ref=e8]:
+      - button "▾ Bed 235×235×250" [expanded] [ref=e9] [cursor=pointer]:
+        - generic [ref=e10]: ▾
+        - generic [ref=e11]: Bed
+        - generic [ref=e12]: 235×235×250
+      - generic [ref=e13]:
+        - generic [ref=e14]:
+          - generic [ref=e15]: Preset
+          - combobox [ref=e16]:
+            - option "Custom…" [selected]
+            - option "Prusa MK3S+"
+            - option "Prusa MK4"
+            - option "Prusa Mini+"
+            - option "Ender 3 / V2"
+            - option "Ender 3 S1 Pro"
+            - option "Bambu A1"
+            - option "Bambu X1 Carbon"
+            - option "Voron 2.4 (300)"
+            - option "Voron Trident (350)"
+            - option "Anycubic Kobra 2"
+        - generic [ref=e17]:
+          - generic [ref=e18]: X
+          - spinbutton [ref=e19]: "235"
+          - generic [ref=e20]: "Y"
+          - spinbutton [ref=e21]: "235"
+          - generic [ref=e22]: Z
+          - spinbutton [ref=e23]: "250"
+        - button "Apply bed size" [ref=e24] [cursor=pointer]
+    - generic [ref=e25]:
+      - button "▾ Upload STL" [expanded] [ref=e26] [cursor=pointer]:
+        - generic [ref=e27]: ▾
+        - generic [ref=e28]: Upload STL
+      - generic [ref=e29]:
+        - generic [ref=e30]:
+          - generic [ref=e31]: Units
+          - combobox [ref=e32]:
+            - option "mm" [selected]
+            - option "inches"
+        - generic [ref=e33] [cursor=pointer]: Drop .stl here or click to browse (mm)
+    - generic [ref=e34]:
+      - button "▾ Parts" [expanded] [ref=e35] [cursor=pointer]:
+        - generic [ref=e36]: ▾
+        - generic [ref=e37]: Parts
+      - generic [ref=e38]:
+        - list
+    - generic [ref=e39]:
+      - button "▾ Slicer" [expanded] [ref=e40] [cursor=pointer]:
+        - generic [ref=e41]: ▾
+        - generic [ref=e42]: Slicer
+      - generic [ref=e43]:
+        - generic [ref=e44]:
+          - generic [ref=e45]: Layer
+          - spinbutton [ref=e46]: "0.4"
+          - generic [ref=e47]: Peri.
+          - spinbutton [ref=e48]: "1"
+        - generic [ref=e49]:
+          - generic [ref=e50]: Infill %
+          - spinbutton [ref=e51]: "20"
+          - generic [ref=e52]: Top
+          - spinbutton [ref=e53]: "3"
+          - generic [ref=e54]: Bot.
+          - spinbutton [ref=e55]: "3"
+        - generic [ref=e56]:
+          - generic [ref=e57]:
+            - checkbox "Supports" [checked] [ref=e58]
+            - text: Supports
+          - spinbutton "Support density %" [ref=e59]: "25"
+        - button "Slice" [disabled] [ref=e60]
+    - generic [ref=e61]:
+      - button "▾ Simulation" [expanded] [ref=e62] [cursor=pointer]:
+        - generic [ref=e63]: ▾
+        - generic [ref=e64]: Simulation
+      - generic [ref=e65]:
+        - generic [ref=e66]:
+          - button "Start" [disabled] [ref=e67]
+          - button "Reset" [disabled] [ref=e68]
+          - button "Jump to end" [disabled] [ref=e69]
+        - generic [ref=e70] [cursor=pointer]:
+          - checkbox "Show toolpath lines" [ref=e71]
+          - text: Show toolpath lines
+    - button "Reset saved preferences" [ref=e73] [cursor=pointer]
+  - main [ref=e74]:
+    - generic [ref=e76]:
+      - generic [ref=e77]:
+        - button "iso" [ref=e78] [cursor=pointer]
+        - button "top" [ref=e79] [cursor=pointer]
+        - button "front" [ref=e80] [cursor=pointer]
+        - button "right" [ref=e81] [cursor=pointer]
+      - button "Focus (f)" [ref=e82] [cursor=pointer]
+    - generic [ref=e83]:
+      - generic [ref=e84]: 235×235×250
+      - generic [ref=e85]: · 0 parts

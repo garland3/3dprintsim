@@ -132,6 +132,7 @@ class FactorySubmitRequest(BaseModel):
     top_layers: int | None = Field(default=None, ge=0)
     bottom_layers: int | None = Field(default=None, ge=0)
     support_density: float | None = Field(default=None, ge=0.0, le=1.0)
+    count: int = Field(default=1, ge=1, le=100)
 
 
 class FactoryConfigRequest(BaseModel):
@@ -661,17 +662,19 @@ def create_app() -> FastAPI:
         top_layers: int | None = Form(None),
         bottom_layers: int | None = Form(None),
         support_density: float | None = Form(None),
+        count: int = Form(1, ge=1, le=100),
         fac: FactoryService = Depends(session_factory),
     ) -> dict:
         """Submit a factory job from a multipart STL upload.
 
         This is the single "upload + slice + start" command the spec calls
         for: drop a file, it gets sliced, queued, and routed to the next
-        available printer. No separate slice or simulation step — the
-        factory owns the full pipeline end-to-end.
+        available printer. `count` lets the caller enqueue N copies of the
+        same STL in one upload — the user picks 10 once instead of dragging
+        the file ten times.
         """
         data = await file.read()
-        name = file.filename or "job.stl"
+        base_name = file.filename or "job.stl"
         params = {
             k: v
             for k, v in {
@@ -684,11 +687,19 @@ def create_app() -> FastAPI:
             }.items()
             if v is not None
         }
+        jobs = []
         try:
-            job = fac.submit_job(name, data, scale=scale, slice_params=params)
+            for i in range(count):
+                name = base_name if count == 1 else f"{base_name} #{i + 1}/{count}"
+                job = fac.submit_job(name, data, scale=scale, slice_params=params)
+                jobs.append(job)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return job.to_public(fac._clock())
+        now = fac._clock()
+        first = jobs[0].to_public(now)
+        if count > 1:
+            first["copies"] = [j.to_public(now) for j in jobs]
+        return first
 
     @app.post("/api/factory/jobs")
     def factory_submit_job(
@@ -708,16 +719,25 @@ def create_app() -> FastAPI:
             }.items()
             if v is not None
         }
+        base_name = body.name or "job.stl"
+        jobs = []
         try:
-            job = fac.submit_job_base64(
-                body.name or "job.stl",
-                body.stl_base64,
-                scale=body.scale,
-                slice_params=params,
-            )
+            for i in range(body.count):
+                name = base_name if body.count == 1 else f"{base_name} #{i + 1}/{body.count}"
+                job = fac.submit_job_base64(
+                    name,
+                    body.stl_base64,
+                    scale=body.scale,
+                    slice_params=params,
+                )
+                jobs.append(job)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return job.to_public(fac._clock())
+        now = fac._clock()
+        first = jobs[0].to_public(now)
+        if body.count > 1:
+            first["copies"] = [j.to_public(now) for j in jobs]
+        return first
 
     @app.get("/api/factory/jobs")
     def factory_list_jobs(
@@ -748,6 +768,19 @@ def create_app() -> FastAPI:
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         return job.to_public(fac._clock())
+
+    @app.get("/api/factory/printers/{printer_id}/slice")
+    def factory_printer_slice(
+        printer_id: str,
+        fac: FactoryService = Depends(session_factory),
+    ) -> dict:
+        """Toolpath for whatever job is currently on the given printer.
+
+        Shape matches `/api/slice` so the same PrinterRig.setToolpath() call
+        path can consume it. Returns `{ready: false}` for idle printers or
+        while their job is still being sliced.
+        """
+        return fac.printer_slice_payload(printer_id)
 
     # Register SPA routes last so the `/{path:path}` catch-all can't preempt
     # any `/api/*` handler above. See `_mount_frontend` for detail.

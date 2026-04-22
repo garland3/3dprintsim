@@ -1,0 +1,42 @@
+- generic [ref=e3]:
+  - generic [ref=e5]:
+    - banner [ref=e6]:
+      - button "New Chat" [ref=e8] [cursor=pointer]:
+        - img [ref=e9]
+        - generic [ref=e10]: New Chat
+      - generic [ref=e11]:
+        - button "Model..." [ref=e13] [cursor=pointer]:
+          - generic [ref=e14]: Model...
+          - img [ref=e15]
+        - generic [ref=e19]: Disconnected
+        - button "Open menu" [ref=e20] [cursor=pointer]:
+          - img [ref=e21]
+    - generic [ref=e23]:
+      - img "Chat UI Logo" [ref=e25]
+      - contentinfo [ref=e26]:
+        - generic [ref=e27]:
+          - generic [ref=e28]:
+            - generic [ref=e29]: "Active Tools:"
+            - generic [ref=e31]:
+              - generic [ref=e32]: canvas
+              - button "Remove canvas" [ref=e33] [cursor=pointer]:
+                - img [ref=e34]
+          - generic [ref=e37]:
+            - img [ref=e38]
+            - generic [ref=e40]:
+              - strong
+              - text: does not support tool/function calling. Selected tools will be ignored. Switch to a tool-capable model to use tools.
+          - generic [ref=e42]:
+            - button "Upload files" [ref=e43] [cursor=pointer]:
+              - img [ref=e44]
+            - textbox "Type a message... (/ or @ for help)" [ref=e47]
+            - button [disabled] [ref=e48]:
+              - img [ref=e49]
+          - generic [ref=e53]:
+            - button "Default Prompt" [ref=e55] [cursor=pointer]:
+              - img [ref=e56]
+              - generic [ref=e59]: Default Prompt
+              - img [ref=e60]
+            - generic [ref=e62]: Press Shift + Enter for new line
+  - button "Give feedback" [ref=e63] [cursor=pointer]:
+    - img [ref=e64]

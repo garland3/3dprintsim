@@ -158,4 +158,6 @@ export const api = {
   factoryConfig: (cfg) => postJSON('/api/factory/config', cfg),
   factoryReset: () =>
     fetch('/api/factory/reset', { method: 'POST', headers: SESSION_HEADERS }).then(json),
+  factoryPrinterSlice: (printerId) =>
+    getJSON(`/api/factory/printers/${encodeURIComponent(printerId)}/slice`),
 };

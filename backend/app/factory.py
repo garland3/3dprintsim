@@ -58,10 +58,23 @@ DEFAULT_UNLOAD_DURATION_S = 3.0
 
 # Grid layout defaults — 3x3 was the spec, leaving the cell pitch at a round
 # number so the shelf coordinates (grid_x, grid_y) render as sensible mm-space
-# positions in the 3D viewer.
+# positions in the 3D viewer. Rows/cols can be overridden per-deployment via
+# `FACTORY_ROWS` / `FACTORY_COLS` env vars (clamped to 1..10 to match the
+# live-config limits).
 DEFAULT_GRID_ROWS = 3
 DEFAULT_GRID_COLS = 3
 DEFAULT_SHELF_PITCH_MM = 400.0
+
+
+def _env_grid_dim(var: str, fallback: int) -> int:
+    raw = os.getenv(var, "").strip()
+    if not raw:
+        return fallback
+    try:
+        n = int(raw)
+    except ValueError:
+        return fallback
+    return max(1, min(10, n))
 
 
 # Job + printer status strings live in one place so UI + MCP clients get a
@@ -111,6 +124,10 @@ class Job:
     filament_cost_usd: float = 0.0
     machine_cost_usd: float = 0.0
     error: str | None = None
+    # Full slice result (layers + moves). Retained on the job so the factory
+    # 3D view can stream toolpath geometry per printer without re-slicing on
+    # every poll. `None` until the job has been sliced successfully.
+    slice_result: object = None
 
     def total_cost_usd(self) -> float:
         return self.filament_cost_usd + self.machine_cost_usd
@@ -233,8 +250,8 @@ class FactoryConfig:
     requeued.
     """
 
-    rows: int = DEFAULT_GRID_ROWS
-    cols: int = DEFAULT_GRID_COLS
+    rows: int = field(default_factory=lambda: _env_grid_dim("FACTORY_ROWS", DEFAULT_GRID_ROWS))
+    cols: int = field(default_factory=lambda: _env_grid_dim("FACTORY_COLS", DEFAULT_GRID_COLS))
     shelf_pitch_mm: float = DEFAULT_SHELF_PITCH_MM
     seconds_per_mm_extruded: float = DEFAULT_SECONDS_PER_MM_EXTRUDED
     unload_duration_s: float = DEFAULT_UNLOAD_DURATION_S
@@ -405,6 +422,7 @@ class FactoryService:
         svc = PrinterService()
         svc.add_part_from_bytes(job.name, job.stl_bytes, scale=scale)
         result = svc.slice_all(**_filtered_slice_params(job.slice_params))
+        job.slice_result = result
         job.total_extrusion_mm = result.moves[-1].e if result.moves else 0.0
         job.filament_g = extrusion_to_mass_g(job.total_extrusion_mm)
         sec_per_mm = max(1e-6, self.config.seconds_per_mm_extruded)
@@ -658,6 +676,33 @@ class FactoryService:
             if p.current_job_id == job_id:
                 return p
         return None
+
+    # --- slice streaming (for the factory 3D view) ---
+
+    def printer_slice_payload(self, printer_id: str) -> dict:
+        """Toolpath payload for the printer's currently-assigned job.
+
+        Mirrors the shape of the single-printer `/api/slice` response so
+        PrinterRig.setToolpath() can consume either. Returns `{ready: False}`
+        when the printer is idle or its job hasn't been sliced yet.
+        """
+        from dataclasses import asdict  # local import: only used here
+
+        with self._lock:
+            self._tick_locked(self._clock())
+            printer = next((p for p in self.printers if p.id == printer_id), None)
+            if printer is None or not printer.current_job_id:
+                return {"ready": False}
+            job = self.jobs.get(printer.current_job_id)
+            if job is None or job.slice_result is None:
+                return {"ready": False}
+            result = job.slice_result
+            return {
+                "ready": True,
+                "job_id": job.id,
+                "summary": result.summary(),
+                "moves": [asdict(m) for m in result.moves],
+            }
 
     # --- introspection ---
 

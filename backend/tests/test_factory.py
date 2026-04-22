@@ -70,7 +70,10 @@ def test_is_factory_enabled_off_values(monkeypatch: pytest.MonkeyPatch):
 # --- direct FactoryService tests ---
 
 
-def test_default_grid_is_3x3():
+def test_default_grid_is_3x3(monkeypatch):
+    # Clear any deployment-level overrides so the built-in defaults stand.
+    monkeypatch.delenv("FACTORY_ROWS", raising=False)
+    monkeypatch.delenv("FACTORY_COLS", raising=False)
     fac = FactoryService()
     assert len(fac.printers) == 9
     # Grid order: top-left (0,0) is first, bottom-right (2,2) is last.
@@ -79,6 +82,29 @@ def test_default_grid_is_3x3():
     # Shelf coords advance by shelf_pitch_mm in x across a row and y across rows.
     assert fac.printers[0].grid_x == 0.0
     assert fac.printers[1].grid_x == fac.config.shelf_pitch_mm
+
+
+def test_env_overrides_default_grid(monkeypatch):
+    monkeypatch.setenv("FACTORY_ROWS", "2")
+    monkeypatch.setenv("FACTORY_COLS", "4")
+    fac = FactoryService()
+    assert fac.config.rows == 2
+    assert fac.config.cols == 4
+    assert len(fac.printers) == 8
+
+
+def test_env_grid_dim_clamps_and_falls_back(monkeypatch):
+    # Out-of-range: clamped to 1..10.
+    monkeypatch.setenv("FACTORY_ROWS", "999")
+    monkeypatch.setenv("FACTORY_COLS", "0")
+    fac = FactoryService()
+    assert fac.config.rows == 10
+    assert fac.config.cols == 1
+    # Garbage: falls back to the built-in default.
+    monkeypatch.setenv("FACTORY_ROWS", "three")
+    monkeypatch.delenv("FACTORY_COLS", raising=False)
+    fac2 = FactoryService()
+    assert fac2.config.rows == 3  # DEFAULT_GRID_ROWS
 
 
 def test_submit_job_assigns_to_first_idle_printer():
@@ -239,6 +265,10 @@ def test_reset_clears_everything():
 @pytest.fixture
 def factory_client(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("FACTORY_ENABLED", "1")
+    # Isolate tests from whatever the repo `.env` happens to set for the
+    # default grid — they assert against the built-in 3x3 defaults.
+    monkeypatch.delenv("FACTORY_ROWS", raising=False)
+    monkeypatch.delenv("FACTORY_COLS", raising=False)
     reset_service()
     app = create_app()
     with TestClient(app) as c:

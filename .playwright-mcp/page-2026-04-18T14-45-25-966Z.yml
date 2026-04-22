@@ -1,0 +1,89 @@
+- generic [ref=e3]:
+  - complementary [ref=e4]:
+    - heading "3D Print Sim" [level=1] [ref=e5]
+    - heading "Bed" [level=2] [ref=e6]
+    - generic [ref=e7]:
+      - generic [ref=e8]: X
+      - spinbutton [ref=e9]: "250"
+      - generic [ref=e10]: "Y"
+      - spinbutton [ref=e11]: "210"
+      - generic [ref=e12]: Z
+      - spinbutton [ref=e13]: "210"
+    - button "Apply bed size" [ref=e14] [cursor=pointer]
+    - heading "Upload STL" [level=2] [ref=e15]
+    - generic [ref=e16]:
+      - generic [ref=e17]: Units
+      - combobox [ref=e18]:
+        - option "mm" [selected]
+        - option "inches"
+    - generic [ref=e19] [cursor=pointer]: Drop .stl here or click to browse (mm)
+    - heading "Parts (1)" [level=2] [ref=e51]
+    - list [ref=e52]:
+      - listitem [ref=e53]:
+        - generic [ref=e54]:
+          - generic [ref=e55]: tshape.stl
+          - generic [ref=e56]: 20.0 × 20.0 × 10.0 mm · 24 tris
+          - generic [ref=e57]:
+            - generic [ref=e58]: scale
+            - spinbutton [ref=e59]: "1"
+            - button "Apply" [ref=e60] [cursor=pointer]
+          - generic [ref=e61]:
+            - generic [ref=e62]: rotate
+            - generic [ref=e63]:
+              - button "−X" [ref=e64] [cursor=pointer]
+              - button "+X" [ref=e65] [cursor=pointer]
+            - generic [ref=e66]:
+              - button "−Y" [ref=e67] [cursor=pointer]
+              - button "+Y" [ref=e68] [cursor=pointer]
+            - generic [ref=e69]:
+              - button "−Z" [ref=e70] [cursor=pointer]
+              - button "+Z" [ref=e71] [cursor=pointer]
+            - button "Reset" [ref=e72] [cursor=pointer]
+        - button "remove" [ref=e73] [cursor=pointer]: ×
+    - generic [ref=e74]:
+      - button "Auto-arrange" [ref=e75] [cursor=pointer]
+      - button "Clear" [ref=e76] [cursor=pointer]
+    - heading "Slicer" [level=2] [ref=e21]
+    - generic [ref=e22]:
+      - generic [ref=e23]: Layer
+      - spinbutton [ref=e24]: "0.4"
+      - generic [ref=e25]: Peri.
+      - spinbutton [ref=e26]: "1"
+    - generic [ref=e27]:
+      - generic [ref=e28]: Infill %
+      - spinbutton [ref=e29]: "20"
+      - generic [ref=e30]: Top
+      - spinbutton [ref=e31]: "3"
+      - generic [ref=e32]: Bot.
+      - spinbutton [ref=e33]: "3"
+    - generic [ref=e34]:
+      - generic [ref=e35]:
+        - checkbox "Supports" [ref=e36]
+        - text: Supports
+      - spinbutton "Support density %" [disabled] [ref=e37]: "25"
+    - button "Slice" [ref=e38] [cursor=pointer]
+    - generic [ref=e77]:
+      - generic [ref=e78]: 25 layers
+      - generic [ref=e79]: 1431 moves
+      - generic [ref=e80]: 282.40 mm extruded
+    - heading "Simulation" [level=2] [ref=e39]
+    - generic [ref=e40]:
+      - button "Start" [ref=e41] [cursor=pointer]
+      - button "Reset" [ref=e42] [cursor=pointer]
+      - button "Jump to end" [ref=e43] [cursor=pointer]
+    - generic [ref=e81]:
+      - slider [ref=e82]: "0"
+      - generic [ref=e83]: 0 / 1431
+    - generic [ref=e44] [cursor=pointer]:
+      - checkbox "Show toolpath lines" [ref=e45]
+      - text: Show toolpath lines
+  - main [ref=e46]:
+    - button "Focus (f)" [ref=e49] [cursor=pointer]
+    - generic [ref=e50]: bed 250×210×210 · parts 1 · 25 layers · 0/1431
+    - generic:
+      - generic: perimeter
+      - generic: overhang
+      - generic: solid fill
+      - generic: sparse infill
+      - generic: support
+      - generic: "supports: 0 cells"
