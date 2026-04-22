@@ -10,6 +10,7 @@ used — that keeps the pre-multiuser code paths working.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import os
 import re
@@ -17,6 +18,7 @@ import threading
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
+from typing import Any
 
 from .arrange import ArrangeError, ArrangeInput, Placement, arrange
 from .slicer import SliceResult, slice_meshes
@@ -160,20 +162,24 @@ class Simulation:
 
 
 class PrinterService:
-    def __init__(self) -> None:
+    def __init__(self, session_id: str | None = None) -> None:
         self._lock = threading.RLock()
+        self.session_id = session_id or DEFAULT_SESSION_ID
         self.bed_size: tuple[float, float, float] = DEFAULT_BED
         self.parts: dict[str, Part] = {}
         self.slice_result: SliceResult | None = None
         self.simulation = Simulation()
-        # Monotonic counter the browser polls to trigger a one-shot viewer
-        # action (currently: camera focus). The counter is preserved across
-        # slice invalidation on purpose — it's a UI signal, not print state.
+        # Monotonic counter the browser polls (or subscribes to via SSE) to
+        # trigger a one-shot viewer action (currently: camera focus). The
+        # counter is preserved across slice invalidation on purpose — it's
+        # a UI signal, not print state.
         self.focus_request: int = 0
-        # Monotonic counter bumped on every mutation. The browser polls
-        # /api/viewer/requests on a 2s tick and re-fetches /api/state when
-        # this advances, so MCP-driven changes (LLM uploads a part, slices,
-        # steps the simulation) appear in the UI without the user clicking.
+        # Monotonic counter bumped on every mutation. The frontend subscribes
+        # to /api/events (SSE); a `state` event is emitted on every increment,
+        # so MCP-driven changes (LLM uploads a part, slices, steps the
+        # simulation) appear in the UI in real time without polling.
+        # /api/viewer/requests remains as a polling fallback for clients that
+        # can't keep an SSE connection open.
         self.state_revision: int = 0
 
     # --- printer config ---
@@ -525,7 +531,14 @@ class PrinterService:
     def request_focus(self) -> int:
         with self._lock:
             self.focus_request += 1
-            return self.focus_request
+            counter = self.focus_request
+        # Publish outside the lock: the broker's delivery is best-effort and
+        # we don't want a slow subscriber to hold the printer's mutation lock.
+        _broker().publish(
+            self.session_id,
+            {"type": "focus", "focus_request": counter},
+        )
+        return counter
 
     def get_viewer_requests(self) -> dict:
         with self._lock:
@@ -558,9 +571,123 @@ class PrinterService:
         # a `with self._lock:` block, so bumping inside that critical section
         # keeps the counter and the state it advertises in lockstep.
         self.state_revision += 1
+        # Fan out to any SSE subscribers for this session. `publish` is
+        # non-blocking (drops on a full queue) and thread-safe — mutations
+        # routinely happen from FastAPI's threadpool worker, while
+        # subscribers live on the main asyncio loop.
+        _broker().publish(
+            self.session_id,
+            {"type": "state", "state_revision": self.state_revision},
+        )
 
 
 DEFAULT_SESSION_ID = "default"
+
+
+# --- Event broker (SSE fan-out) --------------------------------------------
+
+
+# Bounded per-subscriber queue. If a subscriber stalls (slow client, dead
+# TCP connection) we drop newer events rather than block the printer service.
+# 64 is comfortable headroom — a typical MCP call bursts ~5 revisions
+# (upload → arrange → slice → sim start → a few steps).
+_SSE_QUEUE_MAXSIZE = 64
+
+
+class _Subscriber:
+    """One active SSE client. Queue is asyncio-bound; publishers are either
+    on the same loop (async handlers) or on a threadpool worker (FastAPI
+    sync endpoints and fastmcp tool calls), so the publish path goes
+    through `loop.call_soon_threadsafe` to stay race-free.
+    """
+
+    __slots__ = ("queue", "loop")
+
+    def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
+        self.queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(
+            maxsize=_SSE_QUEUE_MAXSIZE
+        )
+        self.loop = loop
+
+
+class EventBroker:
+    """Session-scoped pub/sub for SSE event fan-out.
+
+    Subscribers (one per open `/api/events` connection) register an
+    asyncio.Queue and drain it from the SSE streaming handler. Publishers
+    (PrinterService mutations) push events keyed by session id; each queue
+    in that session receives a copy. Other sessions never see the event, so
+    an LLM driving Alice's printer doesn't leak into Bob's browser.
+
+    Thread-safe: the subscriber set is guarded by a threading.RLock, and
+    enqueues cross the thread → asyncio boundary via `call_soon_threadsafe`.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._subs: dict[str, set[_Subscriber]] = {}
+
+    def subscribe(
+        self, session_id: str, loop: asyncio.AbstractEventLoop
+    ) -> _Subscriber:
+        sub = _Subscriber(loop)
+        with self._lock:
+            self._subs.setdefault(session_id, set()).add(sub)
+        return sub
+
+    def unsubscribe(self, session_id: str, sub: _Subscriber) -> None:
+        with self._lock:
+            bucket = self._subs.get(session_id)
+            if not bucket:
+                return
+            bucket.discard(sub)
+            if not bucket:
+                self._subs.pop(session_id, None)
+
+    def publish(self, session_id: str, event: dict[str, Any]) -> None:
+        """Push `event` to every subscriber in `session_id`. Non-blocking —
+        if a subscriber's queue is full we drop the event for that
+        subscriber rather than stall the caller. Safe to call from any
+        thread."""
+        with self._lock:
+            bucket = self._subs.get(session_id)
+            subs = list(bucket) if bucket else []
+        for sub in subs:
+            # Hop onto the subscriber's loop so Queue.put_nowait is called
+            # from the thread that owns it; otherwise asyncio will raise
+            # RuntimeError from a wrong-thread mutation.
+            try:
+                sub.loop.call_soon_threadsafe(self._enqueue, sub.queue, event)
+            except RuntimeError:
+                # Loop is already closed — skip; the SSE handler will have
+                # already unsubscribed on disconnect.
+                pass
+
+    @staticmethod
+    def _enqueue(queue: asyncio.Queue[dict[str, Any]], event: dict[str, Any]) -> None:
+        try:
+            queue.put_nowait(event)
+        except asyncio.QueueFull:
+            # Drop the event on a full queue rather than block — clients that
+            # can't keep up will simply see fewer updates. The next mutation
+            # carries a fresh revision number so the UI still converges.
+            pass
+
+    def active_sessions(self) -> list[str]:
+        with self._lock:
+            return list(self._subs.keys())
+
+
+_EVENT_BROKER = EventBroker()
+
+
+def _broker() -> EventBroker:
+    return _EVENT_BROKER
+
+
+def get_broker() -> EventBroker:
+    return _EVENT_BROKER
+
 
 # Session ids land in dict keys, so we lock the charset down to keep an
 # attacker from filling the registry with NULs, control chars, very long
@@ -624,7 +751,7 @@ class SessionRegistry:
                         f"session cap reached ({self.max_sessions}); "
                         "refusing to allocate a new PrinterService"
                     )
-                svc = PrinterService()
+                svc = PrinterService(session_id=sid)
                 self._services[sid] = svc
             self._last_seen[sid] = now
             return svc
@@ -726,9 +853,11 @@ def reset_service(session_id: str | None = None) -> None:
 __all__ = [
     "ArrangeError",
     "DEFAULT_SESSION_ID",
+    "EventBroker",
     "PrinterService",
     "Part",
     "SessionRegistry",
+    "get_broker",
     "get_registry",
     "get_service",
     "reset_service",

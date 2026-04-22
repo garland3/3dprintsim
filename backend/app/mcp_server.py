@@ -71,19 +71,6 @@ def _viewer_public_url() -> str:
     return os.getenv("VIEWER_PUBLIC_URL", _backend_public_url())
 
 
-def _atlas_base_url() -> str:
-    """Origin that serves Atlas's `/mcp/files/download/...` endpoints.
-
-    Atlas hands the MCP tool either an absolute URL or a path-only string;
-    paths are resolved against this base. In production Atlas runs on a
-    different host than us, so set `ATLAS_BASE_URL` to its public origin
-    (e.g. `http://atlas:8000`). When unset we fall back to BACKEND_PUBLIC_URL,
-    which preserves the legacy "Atlas and the simulator share an origin"
-    assumption baked into the existing tests.
-    """
-    return os.getenv("ATLAS_BASE_URL") or _backend_public_url()
-
-
 def _normalize_atlas_url(filename: str) -> str:
     """Resolve an Atlas `filename` handoff to an absolute URL we can GET."""
     if filename.startswith("/"):
