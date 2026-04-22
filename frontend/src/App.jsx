@@ -302,45 +302,114 @@ export default function App() {
   // it in deps here would hit the temporal dead zone at render time.
   const refreshStateRef = useRef(null);
 
-  // Poll the backend for one-shot viewer requests (camera focus) and for
-  // server-side state revisions. The latter is how MCP-driven mutations
-  // (LLM uploads a part, slices, advances the simulation) reach the UI —
-  // the backend bumps state_revision on every mutation, and we re-fetch
-  // /api/state whenever it advances past what we last rendered. Two-second
-  // cadence is fine: this is a developer tool and the polls are tiny.
+  // Subscribe to server-sent events for this session. The backend emits a
+  // `state` event on every mutation (carrying the new `state_revision`) and
+  // a `focus` event when `focus_viewer()` is called, so MCP-driven changes
+  // (LLM uploads a part, slices, advances the simulation) reach the UI
+  // within milliseconds instead of the old 2-second polling floor.
+  //
+  // If the SSE connection fails (proxy strips it, network blip) the browser
+  // auto-reconnects. As a belt-and-braces fallback we also run a slow
+  // poll against `/api/viewer/requests`; it gets promoted to the primary
+  // source only if SSE errors sustain.
   useEffect(() => {
     let cancelled = false;
+    let es = null;
+    let fallbackTimer = null;
     let lastFocus = 0;
-    let lastRevision = -1;  // -1 so the first tick seeds without a refetch
-    const tick = async () => {
-      try {
-        const r = await api.viewerRequests();
-        if (cancelled) return;
-        if (r.focus_request > lastFocus) {
-          focusView();
-          lastFocus = r.focus_request;
-        }
-        const rev = typeof r.state_revision === 'number' ? r.state_revision : 0;
-        if (lastRevision < 0) {
-          // First successful tick — accept whatever the server is at without
-          // double-fetching, since the mount-time refreshState() already ran.
-          lastRevision = rev;
-        } else if (rev > lastRevision) {
-          lastRevision = rev;
-          // adoptSimRunning=false: never let a poll-driven refresh flip the
-          // local sim into running=true, otherwise an LLM `start_simulation`
-          // would kick off the client RAF loop, which would race with the
-          // LLM's explicit step calls and end up posting setCursor(total)
-          // back to the backend, overriding tool-controlled progress.
-          await refreshStateRef.current?.({ adoptSimRunning: false });
-        }
-      } catch {
-        // intentional swallow: backend hiccups shouldn't crash the UI
+    let lastRevision = -1;  // -1 so the hello-event seeds without a refetch
+
+    const applyRevision = async (rev, { fromHello = false } = {}) => {
+      if (typeof rev !== 'number') return;
+      if (lastRevision < 0) {
+        // Seed — the mount-time refreshState() already fetched state.
+        lastRevision = rev;
+        return;
+      }
+      if (rev <= lastRevision) return;
+      lastRevision = rev;
+      if (fromHello) return;
+      // adoptSimRunning=false: never let a server-pushed refresh flip the
+      // local sim into running=true, otherwise an LLM `start_simulation`
+      // would kick off the client RAF loop and race the LLM's explicit
+      // step calls.
+      await refreshStateRef.current?.({ adoptSimRunning: false });
+    };
+
+    const applyFocus = (focusRequest) => {
+      if (typeof focusRequest !== 'number') return;
+      if (focusRequest > lastFocus) {
+        focusView();
+        lastFocus = focusRequest;
       }
     };
-    tick();
-    const id = setInterval(tick, 2000);
-    return () => { cancelled = true; clearInterval(id); };
+
+    const startFallback = () => {
+      // Fallback polling at 5s — slower than the old primary poll because
+      // SSE is the happy path; we only need a safety net when the stream
+      // can't be held open.
+      if (fallbackTimer) return;
+      const tick = async () => {
+        if (cancelled) return;
+        try {
+          const r = await api.viewerRequests();
+          if (cancelled) return;
+          applyFocus(r.focus_request);
+          await applyRevision(r.state_revision);
+        } catch {
+          // intentional swallow
+        }
+      };
+      tick();
+      fallbackTimer = setInterval(tick, 5000);
+    };
+
+    const stopFallback = () => {
+      if (fallbackTimer) {
+        clearInterval(fallbackTimer);
+        fallbackTimer = null;
+      }
+    };
+
+    try {
+      es = api.openEvents();
+      es.addEventListener('hello', (e) => {
+        try {
+          const data = JSON.parse(e.data);
+          applyFocus(data.focus_request);
+          applyRevision(data.state_revision, { fromHello: true });
+        } catch {}
+        stopFallback();
+      });
+      es.addEventListener('state', (e) => {
+        try {
+          const data = JSON.parse(e.data);
+          applyRevision(data.state_revision);
+        } catch {}
+      });
+      es.addEventListener('focus', (e) => {
+        try {
+          const data = JSON.parse(e.data);
+          applyFocus(data.focus_request);
+        } catch {}
+      });
+      es.addEventListener('error', () => {
+        // EventSource auto-reconnects, but if it's flapping we want the UI
+        // to still make progress — kick the fallback poller until the next
+        // successful `hello`.
+        if (!cancelled) startFallback();
+      });
+    } catch {
+      // EventSource unsupported or blocked by a sandboxed iframe — fall
+      // back to polling for the lifetime of this mount.
+      startFallback();
+    }
+
+    return () => {
+      cancelled = true;
+      if (es) es.close();
+      stopFallback();
+    };
   }, [focusView]);
 
   // Keep the scene's toolpath visibility in sync with the sidebar toggle.

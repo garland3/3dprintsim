@@ -8,14 +8,16 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const CUBE = path.resolve(here, '../fixtures/cube20.stl');
 const CUBE_SMALL = path.resolve(here, '../fixtures/cube10.stl');
 
-test.beforeEach(async ({ request }) => {
+test.beforeEach(async ({ request, page }) => {
   await request.post('http://127.0.0.1:8000/api/reset');
+  // clear/remove handlers call window.confirm(); auto-accept so the action runs.
+  page.on('dialog', (dialog) => dialog.accept());
 });
 
 test('page loads with default Prusa-sized bed and empty parts list', async ({ page }) => {
   await page.goto('/');
   await expect(page.getByTestId('sidebar')).toBeVisible();
-  await expect(page.getByTestId('overlay')).toContainText('bed 250');
+  await expect(page.getByTestId('overlay')).toContainText('250×210×210');
   await expect(page.getByTestId('parts-list')).toBeEmpty();
 });
 
@@ -25,7 +27,7 @@ test('bed size can be changed from the UI', async ({ page }) => {
   await page.getByTestId('bed-y').fill('180');
   await page.getByTestId('bed-z').fill('180');
   await page.getByTestId('apply-bed').click();
-  await expect(page.getByTestId('overlay')).toContainText('bed 180');
+  await expect(page.getByTestId('overlay')).toContainText('180×180×180');
 });
 
 test('uploading an STL adds it to the parts list with the right size', async ({ page }) => {

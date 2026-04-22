@@ -85,9 +85,22 @@ function postJSON(path, body) {
   }).then(json);
 }
 
+// Open a Server-Sent Events stream scoped to this tab's session. EventSource
+// can't set custom headers, so the session id rides in the URL — the backend
+// already accepts `?session=` as a fallback for the same-named header.
+//
+// The caller is responsible for `close()` on unmount; we return the raw
+// EventSource so React effects can attach `addEventListener` handlers and
+// cleanly tear down on dependency changes.
+function openEvents() {
+  const url = `/api/events?session=${encodeURIComponent(sessionId)}`;
+  return new EventSource(url);
+}
+
 export const api = {
   sessionId,
   isEmbedded,
+  openEvents,
   health: () => getJSON('/api/health'),
   sessionInfo: () => getJSON('/api/session'),
   state: () => getJSON('/api/state'),

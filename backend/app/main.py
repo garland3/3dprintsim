@@ -14,7 +14,9 @@ Session resolution precedence (first match wins):
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
+import json
 import os
 from dataclasses import asdict
 from pathlib import Path
@@ -22,7 +24,7 @@ from typing import Literal
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, PlainTextResponse, Response
+from fastapi.responses import FileResponse, PlainTextResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -30,7 +32,13 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from .arrange import ArrangeError
 from .env import load_dotenv
 from .mcp_server import build_mcp
-from .state import DEFAULT_SESSION_ID, PrinterService, get_service, reset_service
+from .state import (
+    DEFAULT_SESSION_ID,
+    PrinterService,
+    get_broker,
+    get_service,
+    reset_service,
+)
 
 load_dotenv()
 
@@ -105,6 +113,17 @@ class PartPositionRequest(BaseModel):
 
     x: float = Field(ge=0)
     y: float = Field(ge=0)
+
+
+def _sse_format(event: str, data: dict) -> str:
+    """Serialize a single Server-Sent Event frame.
+
+    EventSource parsers require each event terminate with a blank line. We
+    put the JSON payload on a single `data:` line since our payloads are
+    small and never contain newlines; the spec's multi-line rule only matters
+    for multi-line strings.
+    """
+    return f"event: {event}\ndata: {json.dumps(data, separators=(',', ':'))}\n\n"
 
 
 def _session_id(request: Request, session: str | None = None) -> str:
@@ -537,9 +556,88 @@ def create_app() -> FastAPI:
     def sim_frame(svc: PrinterService = Depends(session_service)) -> dict:
         return svc.get_simulation_frame()
 
+    @app.get("/api/events")
+    async def events(
+        request: Request,
+        session: str | None = Query(default=None),
+    ) -> StreamingResponse:
+        """Server-Sent Events stream: pushes `state` and `focus` events the
+        moment a mutation (HTTP or MCP) happens in this session.
+
+        EventSource can't set custom headers, so the session id comes in via
+        the `?session=` query param (same fallback the rest of /api uses).
+        A malformed id → 400 so callers don't silently get the default
+        session's stream.
+
+        The stream emits:
+          - `event: state` with a JSON payload carrying the new
+            `state_revision`. The client re-fetches `/api/state`.
+          - `event: focus` for camera-focus requests from `focus_viewer()`.
+          - `event: hello` on subscribe, carrying the current revision and
+            focus counter — lets the client seed its state and skip a
+            pointless refresh if nothing has changed since page load.
+          - `: ping` comments every 15s so intermediate proxies don't kill
+            the connection as idle.
+        """
+        try:
+            sid = _session_id(request, session)
+            svc = get_service(sid)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        broker = get_broker()
+        loop = asyncio.get_running_loop()
+        sub = broker.subscribe(sid, loop)
+
+        # Seed the stream with the current counters so the client doesn't
+        # have to race a first /api/state against an early event.
+        snapshot = svc.get_viewer_requests()
+
+        async def generator():
+            try:
+                yield _sse_format(
+                    "hello",
+                    {
+                        "session_id": sid,
+                        "state_revision": snapshot["state_revision"],
+                        "focus_request": snapshot["focus_request"],
+                    },
+                )
+                while True:
+                    if await request.is_disconnected():
+                        return
+                    try:
+                        event = await asyncio.wait_for(
+                            sub.queue.get(), timeout=15.0
+                        )
+                    except asyncio.TimeoutError:
+                        # Keepalive comment — ignored by EventSource but keeps
+                        # the TCP connection warm through proxies.
+                        yield ": ping\n\n"
+                        continue
+                    kind = event.get("type", "message")
+                    payload = {k: v for k, v in event.items() if k != "type"}
+                    yield _sse_format(kind, payload)
+            finally:
+                broker.unsubscribe(sid, sub)
+
+        return StreamingResponse(
+            generator(),
+            media_type="text/event-stream",
+            # Disable buffering in upstream proxies (nginx respects this).
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+                "X-Session-Id": sid,
+            },
+        )
+
     @app.get("/api/viewer/requests")
     def viewer_requests(svc: PrinterService = Depends(session_service)) -> dict:
-        """Tiny polling endpoint: returns one-shot UI request counters."""
+        """Polling fallback for clients that can't hold an SSE connection
+        open (some iframes, stricter corporate proxies). The SSE stream at
+        `/api/events` is the preferred path — it surfaces mutations within
+        milliseconds, where polling's ceiling is the client's tick rate."""
         return svc.get_viewer_requests()
 
     @app.post("/api/viewer/focus")
