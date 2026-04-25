@@ -18,13 +18,49 @@ from __future__ import annotations
 import ipaddress
 import os
 import socket
+from typing import Any
 from urllib.parse import urljoin, urlparse
 
 import httpx
+import pydantic_core
 from fastmcp import Context, FastMCP
 from fastmcp.server.dependencies import get_http_headers
 
 from .state import DEFAULT_SESSION_ID, PrinterService, get_service
+
+
+def _jsonable_fallback(obj: Any) -> Any:
+    """Last-chance coercion for types pydantic_core doesn't recognise.
+
+    Numpy scalars expose `.item()` returning a Python primitive — call it so
+    a future trimesh-backed mesh path doesn't end up stringifying every
+    coordinate. Anything still unknown becomes `str(obj)` rather than raising.
+    """
+    item = getattr(obj, "item", None)
+    if callable(item) and hasattr(obj, "dtype"):
+        try:
+            return item()
+        except Exception:
+            pass
+    return str(obj)
+
+
+def _jsonable(value: Any) -> Any:
+    """Coerce a tool return value to JSON-native Python types.
+
+    Belt-and-suspenders against the "Object of type X is not JSON serializable"
+    failures Atlas surfaces when *anything* non-primitive sneaks into a tool
+    response — numpy scalars from a future trimesh path, dataclass instances,
+    a stray `mcp.types.Root` echoed back by a misbehaving client, etc.
+    `to_jsonable_python` walks the value tree and turns each of those into
+    primitives; the fallback handles numpy scalars and stringifies anything
+    still unknown so the call never raises.
+
+    Apply this to every tool's return so a single careless field — say a
+    bare `tuple` somewhere — can't take down a downstream caller that uses
+    stdlib `json.dumps` to render the response.
+    """
+    return pydantic_core.to_jsonable_python(value, fallback=_jsonable_fallback)
 
 
 # Atlas file-upload handoff: when an Atlas host injects a file into an MCP call
@@ -233,12 +269,12 @@ def build_mcp() -> FastMCP:
     @mcp.tool
     def get_printer_state(ctx: Context) -> dict:
         """Return bed size, loaded parts, slice summary, and simulation cursor."""
-        return _svc(ctx).get_state()
+        return _jsonable(_svc(ctx).get_state())
 
     @mcp.tool
     def set_bed_size(x_mm: float, y_mm: float, z_mm: float, ctx: Context) -> dict:
         """Resize the virtual print bed. Defaults to Prusa i3-style 250x210x210mm."""
-        return _svc(ctx).set_bed_size(x_mm, y_mm, z_mm)
+        return _jsonable(_svc(ctx).set_bed_size(x_mm, y_mm, z_mm))
 
     @mcp.tool
     def atlas_upload(
@@ -296,7 +332,7 @@ def build_mcp() -> FastMCP:
 
         display_name = name.strip() if name and name.strip() else _atlas_display_name(url)
         part = _svc(ctx).add_part_from_bytes(display_name, data, scale=scale)
-        return part.to_public()
+        return _jsonable(part.to_public())
 
     @mcp.tool
     def upload_stl(name: str, stl_base64: str, ctx: Context, scale: float = 1.0) -> dict:
@@ -306,13 +342,13 @@ def build_mcp() -> FastMCP:
         25.4 for an STL authored in inches, 0.001 for metres, etc.
         """
         part = _svc(ctx).add_part_from_base64(name, stl_base64, scale=scale)
-        return part.to_public()
+        return _jsonable(part.to_public())
 
     @mcp.tool
     def set_part_scale(part_id: str, scale: float, ctx: Context) -> dict:
         """Resize a loaded part by a linear scale factor (e.g. 2.0 doubles every dimension)."""
         part = _svc(ctx).set_part_scale(part_id, scale)
-        return part.to_public()
+        return _jsonable(part.to_public())
 
     @mcp.tool
     def rotate_part(part_id: str, axis: str, degrees: float, ctx: Context) -> dict:
@@ -323,13 +359,13 @@ def build_mcp() -> FastMCP:
         cleanups. Use `reset_part_rotation` to clear back to identity.
         """
         part = _svc(ctx).rotate_part(part_id, axis, degrees)
-        return part.to_public()
+        return _jsonable(part.to_public())
 
     @mcp.tool
     def reset_part_rotation(part_id: str, ctx: Context) -> dict:
         """Clear all accumulated rotation on `part_id` back to the imported pose."""
         part = _svc(ctx).rotate_part(part_id, "z", 0.0, reset=True)
-        return part.to_public()
+        return _jsonable(part.to_public())
 
     @mcp.tool
     def set_part_position(part_id: str, x: float, y: float, ctx: Context) -> dict:
@@ -340,33 +376,35 @@ def build_mcp() -> FastMCP:
         dragging a part in the UI.
         """
         part = _svc(ctx).set_part_position(part_id, x, y)
-        return part.to_public()
+        return _jsonable(part.to_public())
 
     @mcp.tool
     def list_parts(ctx: Context) -> list[dict]:
         """List all loaded parts."""
-        return [p.to_public() for p in _svc(ctx).parts.values()]
+        return _jsonable([p.to_public() for p in _svc(ctx).parts.values()])
 
     @mcp.tool
     def remove_part(part_id: str, ctx: Context) -> dict:
         """Remove a part by id."""
         _svc(ctx).remove_part(part_id)
-        return {"ok": True, "removed": part_id}
+        return _jsonable({"ok": True, "removed": part_id})
 
     @mcp.tool
     def clear_parts(ctx: Context) -> dict:
         """Remove all parts from the bed."""
         _svc(ctx).clear_parts()
-        return {"ok": True}
+        return _jsonable({"ok": True})
 
     @mcp.tool
     def auto_arrange(ctx: Context) -> list[dict]:
         """Pack all loaded parts onto the bed using a shelf packer. Returns placements."""
         placements = _svc(ctx).auto_arrange()
-        return [
-            {"part_id": p.part_id, "x": p.x, "y": p.y, "rotation_deg": p.rotation_deg}
-            for p in placements
-        ]
+        return _jsonable(
+            [
+                {"part_id": p.part_id, "x": p.x, "y": p.y, "rotation_deg": p.rotation_deg}
+                for p in placements
+            ]
+        )
 
     @mcp.tool
     def slice_all(
@@ -445,7 +483,7 @@ def build_mcp() -> FastMCP:
             layer_height_min=layer_height_min,
             layer_height_max=layer_height_max,
         )
-        return result.summary()
+        return _jsonable(result.summary())
 
     @mcp.tool
     def get_gcode(ctx: Context) -> str:
@@ -453,17 +491,19 @@ def build_mcp() -> FastMCP:
         svc = _svc(ctx)
         if svc.slice_result is None:
             raise ValueError("slice first")
-        return svc.slice_result.gcode
+        return str(svc.slice_result.gcode)
 
     @mcp.tool
     def start_simulation(ctx: Context, speed: float = 1.0) -> dict:
         """Start/reset the simulation cursor at 0. Returns simulation state."""
         sim = _svc(ctx).start_simulation(speed=speed)
-        return {
-            "running": sim.running,
-            "cursor": sim.cursor,
-            "speed": sim.speed,
-        }
+        return _jsonable(
+            {
+                "running": sim.running,
+                "cursor": sim.cursor,
+                "speed": sim.speed,
+            }
+        )
 
     @mcp.tool
     def step_simulation(ctx: Context, steps: int = 1) -> dict:
@@ -471,11 +511,13 @@ def build_mcp() -> FastMCP:
         svc = _svc(ctx)
         sim = svc.step_simulation(steps=steps)
         total = len(svc.slice_result.moves) if svc.slice_result else 0
-        return {
-            "running": sim.running,
-            "cursor": sim.cursor,
-            "total_moves": total,
-        }
+        return _jsonable(
+            {
+                "running": sim.running,
+                "cursor": sim.cursor,
+                "total_moves": total,
+            }
+        )
 
     @mcp.tool
     def set_simulation_cursor(cursor: int, ctx: Context) -> dict:
@@ -483,16 +525,18 @@ def build_mcp() -> FastMCP:
         svc = _svc(ctx)
         sim = svc.set_simulation_cursor(cursor)
         total = len(svc.slice_result.moves) if svc.slice_result else 0
-        return {
-            "running": sim.running,
-            "cursor": sim.cursor,
-            "total_moves": total,
-        }
+        return _jsonable(
+            {
+                "running": sim.running,
+                "cursor": sim.cursor,
+                "total_moves": total,
+            }
+        )
 
     @mcp.tool
     def get_simulation_frame(ctx: Context) -> dict:
         """Return the current head position and extruded moves-so-far."""
-        return _svc(ctx).get_simulation_frame()
+        return _jsonable(_svc(ctx).get_simulation_frame())
 
     @mcp.tool
     def focus_viewer(ctx: Context) -> dict:
@@ -500,7 +544,7 @@ def build_mcp() -> FastMCP:
         ~90% of the viewport. The browser polls for this request, so the
         effect is visible in a running UI session within a couple of seconds.
         """
-        return {"focus_request": _svc(ctx).request_focus()}
+        return _jsonable({"focus_request": _svc(ctx).request_focus()})
 
     @mcp.tool
     def open_viewer(ctx: Context, title: str = "3D Print Simulator") -> dict:
@@ -523,27 +567,29 @@ def build_mcp() -> FastMCP:
         # render in iframe-friendly mode; `session=<sid>` wires every REST
         # call from that tab back to this MCP session's PrinterService.
         url = f"{base}/?embed=1&session={sid}"
-        return {
-            "results": {
-                "content": (
-                    "Live printer viewer opened in the canvas. The user can "
-                    "watch slicing + simulation in real time as you drive it."
-                ),
-                "session_id": sid,
-                "url": url,
-            },
-            "artifacts": [],
-            "display": {
-                "open_canvas": True,
-                "type": "iframe",
-                "url": url,
-                "title": title,
-                # allow-same-origin lets the iframe's fetch() calls send the
-                # X-Session-Id header to /api/* on the same origin; allow-scripts
-                # is required for the React app to boot.
-                "sandbox": "allow-scripts allow-same-origin allow-downloads",
-                "mode": "replace",
-            },
-        }
+        return _jsonable(
+            {
+                "results": {
+                    "content": (
+                        "Live printer viewer opened in the canvas. The user can "
+                        "watch slicing + simulation in real time as you drive it."
+                    ),
+                    "session_id": sid,
+                    "url": url,
+                },
+                "artifacts": [],
+                "display": {
+                    "open_canvas": True,
+                    "type": "iframe",
+                    "url": url,
+                    "title": title,
+                    # allow-same-origin lets the iframe's fetch() calls send the
+                    # X-Session-Id header to /api/* on the same origin; allow-scripts
+                    # is required for the React app to boot.
+                    "sandbox": "allow-scripts allow-same-origin allow-downloads",
+                    "mode": "replace",
+                },
+            }
+        )
 
     return mcp

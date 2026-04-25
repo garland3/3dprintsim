@@ -129,17 +129,27 @@ class Part:
         return translate(base, dx, dy, dz)
 
     def to_public(self) -> dict:
+        # Coerce every numeric to a builtin float so the dict is guaranteed
+        # JSON-safe. Without this, an upstream Pydantic model (e.g. a stray
+        # mcp.types.Root from a client `roots/list_changed` round-trip) or a
+        # numpy scalar from a future trimesh-backed mesh path can leak through
+        # and trip stdlib json.dumps with "Object of type X is not JSON
+        # serializable" inside FastMCP's serialization layer.
         size = self.scaled_size()
         return {
             "id": self.id,
             "name": self.name,
-            "size": list(size),
-            "scale": self.scale,
-            "rotation": [list(row) for row in self.rotation],
+            "size": [float(v) for v in size],
+            "scale": float(self.scale),
+            "rotation": [[float(v) for v in row] for row in self.rotation],
             "triangle_count": len(self.mesh.triangles),
             "warnings": list(self.warnings),
             "placement": (
-                {"x": self.placement.x, "y": self.placement.y, "rotation_deg": self.placement.rotation_deg}
+                {
+                    "x": float(self.placement.x),
+                    "y": float(self.placement.y),
+                    "rotation_deg": float(self.placement.rotation_deg),
+                }
                 if self.placement
                 else None
             ),
@@ -444,7 +454,16 @@ class PrinterService:
                     kwargs[k] = v
             result = slice_meshes(meshes, **kwargs)
             self.slice_result = result
-            self.simulation = Simulation(running=False, cursor=0, speed=self.simulation.speed)
+            # Park the cursor at the end of the toolpath so the viewer shows
+            # the finished print by default after slicing — matches the local
+            # UI's post-slice behavior (handleSlice manually setCursor(total))
+            # and gives MCP-driven slices a sensible "what will it look like"
+            # preview without the caller needing a follow-up step_simulation.
+            self.simulation = Simulation(
+                running=False,
+                cursor=len(result.moves),
+                speed=self.simulation.speed,
+            )
             self._bump_revision()
             return result
 

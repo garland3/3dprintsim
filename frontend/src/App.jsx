@@ -329,11 +329,7 @@ export default function App() {
       if (rev <= lastRevision) return;
       lastRevision = rev;
       if (fromHello) return;
-      // adoptSimRunning=false: never let a server-pushed refresh flip the
-      // local sim into running=true, otherwise an LLM `start_simulation`
-      // would kick off the client RAF loop and race the LLM's explicit
-      // step calls.
-      await refreshStateRef.current?.({ adoptSimRunning: false });
+      await refreshStateRef.current?.();
     };
 
     const applyFocus = (focusRequest) => {
@@ -421,12 +417,7 @@ export default function App() {
     if (sceneRef.current) sceneRef.current.setPartsSimVisible(showPartsDuringSim);
   }, [showPartsDuringSim]);
 
-  // `adoptSimRunning` defaults to true so existing user-action callers
-  // (upload, slice, sim controls) keep their behavior. The polling path
-  // passes `false` so an LLM-driven `start_simulation` can't flip the
-  // local sim into running=true and start the client RAF loop racing the
-  // tool's own step calls.
-  const refreshState = useCallback(async ({ adoptSimRunning = true } = {}) => {
+  const refreshState = useCallback(async () => {
     try {
       const st = await api.state();
       setBed({ x: st.bed_size[0], y: st.bed_size[1], z: st.bed_size[2] });
@@ -435,12 +426,8 @@ export default function App() {
       setSim((s) => ({
         ...s,
         // Don't let a backend refresh clobber a client-side simulation in
-        // flight; the local RAF loop is authoritative while running. And
-        // for poll-driven refreshes, never propagate backend running=true
-        // either — see the polling effect comment for the rationale.
-        running: s.running
-          ? s.running
-          : (adoptSimRunning ? st.simulation.running : false),
+        // flight; the local RAF loop is authoritative while running.
+        running: s.running ? s.running : st.simulation.running,
         cursor: s.running ? s.cursor : st.simulation.cursor,
         total: st.simulation.total_moves,
         // Keep the user's speed choice authoritative on the frontend; the
@@ -480,6 +467,50 @@ export default function App() {
     return () => { cancelled = true; };
   }, [parts]);
 
+  // Track sim.cursor in a ref so the slice-toolpath effect (which is async
+  // and shouldn't refire on every cursor tick) can read the *current* cursor
+  // when reapplying it after a toolpath rebuild.
+  const simCursorRef = useRef(0);
+  useEffect(() => { simCursorRef.current = sim.cursor; }, [sim.cursor]);
+
+  // Push slice toolpath into the scene whenever the slice itself changes.
+  // refreshState() (called by SSE state events) only updates React state;
+  // without this effect, MCP-driven slice_all calls never reach the
+  // Three.js scene — only handleSlice/handleStartSim push moves into it.
+  // Keyed off move_count (a primitive) so cursor-only mutations (which
+  // also bump state_revision) don't trigger a redundant slice refetch.
+  //
+  // Mirrors handleSlice's ordering: setToolpath FIRST, then setCursor.
+  // setToolpath rebuilds the scene's render-up-to index, so without the
+  // trailing setCursor the scene shows nothing until the next cursor
+  // mutation — which on the MCP path may never come (slice_all parks the
+  // cursor at the end and that's it).
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      if (!sceneRef.current) return;
+      if (!sliceSummary) {
+        sceneRef.current.setToolpath([]);
+        setLayerStarts([]);
+        return;
+      }
+      const slicePayload = await api.getSlice();
+      if (cancelled || !slicePayload.ready) return;
+      sceneRef.current.setToolpath(slicePayload.moves);
+      setLayerStarts(computeLayerStarts(slicePayload.moves));
+      sceneRef.current.setCursor(simCursorRef.current);
+    })();
+    return () => { cancelled = true; };
+  }, [sliceSummary?.move_count]);
+
+  // Sync the scene cursor with React state so MCP-driven cursor moves
+  // (start_simulation, step_simulation, set_simulation_cursor) appear
+  // in the viewer. The RAF loop also calls setCursor directly while a
+  // run is active; this effect catches the static / external-update cases.
+  useEffect(() => {
+    if (sceneRef.current) sceneRef.current.setCursor(sim.cursor);
+  }, [sim.cursor]);
+
   const handleUpload = run('upload', async (file) => {
     if (!file) return;
     const scale = uploadUnit === 'in' ? MM_PER_INCH : 1;
@@ -507,6 +538,12 @@ export default function App() {
       sceneRef.current.setToolpath(slicePayload.moves);
     }
     setLayerStarts(slicePayload.ready ? computeLayerStarts(slicePayload.moves) : []);
+    if (slicePayload.ready) {
+      const total = slicePayload.moves.length;
+      if (sceneRef.current) sceneRef.current.setCursor(total);
+      setSim((s) => ({ ...s, running: false, cursor: total, total }));
+      await api.setCursor(total);
+    }
     await refreshState();
   });
 
