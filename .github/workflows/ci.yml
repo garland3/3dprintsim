@@ -16,13 +16,15 @@ jobs:
         uses: astral-sh/setup-uv@v5
         with:
           # Pin to match the Dockerfile's UV_VERSION so local, Docker, and CI
-          # builds resolve against the same uv release.
-          version: "0.8.17"
+          # builds resolve against the same uv release. Older uv ships a stale
+          # download index that resolves `uv python install 3.14` to 3.14.0rc2,
+          # which crashes pydantic 2.12.5's ForwardRef handling.
+          version: "0.9.26"
           enable-cache: true
           cache-dependency-glob: backend/uv.lock
 
       - name: Set up Python
-        run: uv python install 3.11
+        run: uv python install 3.14.2
         working-directory: backend
 
       - name: Install backend dependencies
