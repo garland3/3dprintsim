@@ -10,9 +10,6 @@ ARG UBI_VERSION=9.4
 ARG UBI_NODEJS_TAG=1
 # Pin uv so resolver/CLI changes in a future release can't silently break the
 # backend install step; bump deliberately when rolling the lockfile.
-# Bumped to an uv release that knows about CPython 3.14.2 — older uv ships
-# with a stale download index that resolves `uv python install 3.14` to
-# 3.14.0rc2, and pydantic 2.12.5's ForwardRef handling crashes on that build.
 ARG UV_VERSION=0.9.26
 
 # ─── Stage 1 — build the React/Vite frontend ──────────────────────────────────
@@ -34,10 +31,10 @@ FROM registry.access.redhat.com/ubi9/ubi:${UBI_VERSION} AS runtime
 # a stage (Docker scoping rule).
 ARG UV_VERSION
 
-# uv manages Python itself — UBI9 doesn't ship 3.14, and uv's standalone
-# CPython builds work fine in rootless podman. Bootstrap uv via the official
-# installer (no system Python needed at runtime; uv downloads 3.14 on `uv sync`
-# below). We still skip shadow-utils for the same reason as before: it carries
+# uv manages Python itself, and uv's standalone CPython builds work fine in
+# rootless podman. Bootstrap uv via the official installer (no system Python
+# needed at runtime; uv downloads 3.11 on `uv sync` below). We still skip
+# shadow-utils for the same reason as before: it carries
 # file capabilities that setcap can't apply under rootless build.
 # curl-minimal + ca-certificates are already in the UBI9 base — installing
 # the full `curl` package conflicts with curl-minimal under dnf, so we just
@@ -57,10 +54,10 @@ ENV UV_PROJECT_ENVIRONMENT=/app/backend/.venv \
     UV_LINK_MODE=copy \
     UV_COMPILE_BYTECODE=1 \
     UV_PYTHON_INSTALL_DIR=/opt/uv-python \
-    UV_PYTHON=3.14.2
+    UV_PYTHON=3.11
 COPY backend/pyproject.toml backend/uv.lock /app/backend/
 WORKDIR /app/backend
-RUN uv python install 3.14.2 \
+RUN uv python install 3.11 \
     && uv sync --frozen --no-install-project
 
 COPY backend/ /app/backend/
