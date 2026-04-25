@@ -216,6 +216,49 @@ def _atlas_display_name(url: str, fallback: str = "atlas.stl") -> str:
     return fallback
 
 
+def _fetch_atlas_stl(filename: str, name: str = "") -> tuple[bytes, str]:
+    """Resolve + download an Atlas-hosted STL into memory.
+
+    Returns `(stl_bytes, display_name)`. Shared by every tool that ingests
+    an Atlas file handoff so the SSRF guard, byte cap, and naming rules
+    only live in one place.
+    """
+    if not filename:
+        raise ValueError("filename (Atlas download URL) is required")
+
+    url = _normalize_atlas_url(filename)
+    # Guard against SSRF: enforce http/https, allowlisted hosts, and
+    # reject hosts that resolve to private/loopback/reserved IPs. Must
+    # run *before* the HTTP client opens a connection.
+    _reject_ssrf(url)
+
+    try:
+        # follow_redirects=False keeps a 30x from bouncing the fetch to
+        # an internal host after the allowlist check has already passed.
+        with httpx.Client(timeout=_ATLAS_FETCH_TIMEOUT, follow_redirects=False) as client:
+            with client.stream("GET", url) as resp:
+                resp.raise_for_status()
+                chunks: list[bytes] = []
+                total = 0
+                for chunk in resp.iter_bytes():
+                    total += len(chunk)
+                    if total > _ATLAS_MAX_BYTES:
+                        raise ValueError(
+                            f"Atlas file exceeds {_ATLAS_MAX_BYTES // (1024 * 1024)} MiB cap"
+                        )
+                    chunks.append(chunk)
+                data = b"".join(chunks)
+    except httpx.HTTPStatusError as exc:
+        raise ValueError(
+            f"Atlas download failed: HTTP {exc.response.status_code}"
+        ) from exc
+    except httpx.HTTPError as exc:
+        raise ValueError(f"Atlas download failed: {exc}") from exc
+
+    display_name = name.strip() if name and name.strip() else _atlas_display_name(url)
+    return data, display_name
+
+
 def _session_id(ctx: Context | None) -> str:
     """Resolve the active session id for this tool invocation.
 
@@ -253,6 +296,21 @@ def _svc(ctx: Context | None) -> PrinterService:
     return get_service(_session_id(ctx))
 
 
+def _enabled_tools() -> set[str] | None:
+    """Parse MCP_ENABLED_TOOLS into an allowlist set, or None for "all tools".
+
+    Set MCP_ENABLED_TOOLS in .env to a comma-separated list of tool names
+    (e.g. `open_viewer,atlas_upload_slice_simulate`) to expose only those
+    tools to MCP clients. Unset / empty / "*" / "all" means every tool is
+    registered, matching the historical behavior. Whitespace and stray
+    commas are tolerated; names are case-sensitive to match @mcp.tool.
+    """
+    raw = os.getenv("MCP_ENABLED_TOOLS", "").strip()
+    if not raw or raw.lower() in ("*", "all"):
+        return None
+    return {name.strip() for name in raw.split(",") if name.strip()}
+
+
 def build_mcp() -> FastMCP:
     mcp = FastMCP(
         name="3dprintsim",
@@ -266,17 +324,28 @@ def build_mcp() -> FastMCP:
         ),
     )
 
-    @mcp.tool
+    # Optional allowlist — when set, only these tool names are registered.
+    # Lets operators expose a slimmed-down surface (e.g. just open_viewer +
+    # atlas_upload_slice_simulate for a "drop file → watch it print" flow)
+    # without having to fork the module.
+    allowlist = _enabled_tools()
+
+    def tool(fn):
+        if allowlist is not None and fn.__name__ not in allowlist:
+            return fn
+        return mcp.tool(fn)
+
+    @tool
     def get_printer_state(ctx: Context) -> dict:
         """Return bed size, loaded parts, slice summary, and simulation cursor."""
         return _jsonable(_svc(ctx).get_state())
 
-    @mcp.tool
+    @tool
     def set_bed_size(x_mm: float, y_mm: float, z_mm: float, ctx: Context) -> dict:
         """Resize the virtual print bed. Defaults to Prusa i3-style 250x210x210mm."""
         return _jsonable(_svc(ctx).set_bed_size(x_mm, y_mm, z_mm))
 
-    @mcp.tool
+    @tool
     def atlas_upload(
         filename: str,
         ctx: Context,
@@ -298,43 +367,64 @@ def build_mcp() -> FastMCP:
         URL path. `scale` works the same as upload_stl (25.4 for inches,
         0.001 for metres, etc).
         """
-        if not filename:
-            raise ValueError("filename (Atlas download URL) is required")
-
-        url = _normalize_atlas_url(filename)
-        # Guard against SSRF: enforce http/https, allowlisted hosts, and
-        # reject hosts that resolve to private/loopback/reserved IPs. Must
-        # run *before* the HTTP client opens a connection.
-        _reject_ssrf(url)
-
-        try:
-            # follow_redirects=False keeps a 30x from bouncing the fetch to
-            # an internal host after the allowlist check has already passed.
-            with httpx.Client(timeout=_ATLAS_FETCH_TIMEOUT, follow_redirects=False) as client:
-                with client.stream("GET", url) as resp:
-                    resp.raise_for_status()
-                    chunks: list[bytes] = []
-                    total = 0
-                    for chunk in resp.iter_bytes():
-                        total += len(chunk)
-                        if total > _ATLAS_MAX_BYTES:
-                            raise ValueError(
-                                f"Atlas file exceeds {_ATLAS_MAX_BYTES // (1024 * 1024)} MiB cap"
-                            )
-                        chunks.append(chunk)
-                    data = b"".join(chunks)
-        except httpx.HTTPStatusError as exc:
-            raise ValueError(
-                f"Atlas download failed: HTTP {exc.response.status_code}"
-            ) from exc
-        except httpx.HTTPError as exc:
-            raise ValueError(f"Atlas download failed: {exc}") from exc
-
-        display_name = name.strip() if name and name.strip() else _atlas_display_name(url)
+        data, display_name = _fetch_atlas_stl(filename, name)
         part = _svc(ctx).add_part_from_bytes(display_name, data, scale=scale)
         return _jsonable(part.to_public())
 
-    @mcp.tool
+    @tool
+    def atlas_upload_slice_simulate(
+        filename: str,
+        ctx: Context,
+        name: str = "",
+        scale: float = 1.0,
+        layer_height_mm: float = 0.4,
+        perimeters: int = 1,
+        infill_density: float = 0.2,
+        top_layers: int = 3,
+        bottom_layers: int = 3,
+        nozzle_width_mm: float = 0.4,
+        support_density: float = 0.25,
+        sim_speed: float = 1.0,
+    ) -> dict:
+        """One-shot: download an Atlas-hosted STL, slice it, and start the sim.
+
+        Convenience wrapper that fuses `atlas_upload` → `slice_all` →
+        `start_simulation` into a single tool call. Useful when the user
+        drops an STL into chat and just says "print it" — saves three
+        round-trips and lets Atlas show progress in one step.
+
+        Slicing uses the simulator defaults; pass the standard slice knobs
+        to override. Auto-arrange runs implicitly inside `slice_all` for
+        any unplaced part. Returns the new part, the slice summary, and
+        the initial simulation state.
+        """
+        data, display_name = _fetch_atlas_stl(filename, name)
+        svc = _svc(ctx)
+        part = svc.add_part_from_bytes(display_name, data, scale=scale)
+        slice_result = svc.slice_all(
+            layer_height=layer_height_mm,
+            perimeters=perimeters,
+            infill_density=infill_density,
+            top_layers=top_layers,
+            bottom_layers=bottom_layers,
+            nozzle_width=nozzle_width_mm,
+            support_density=support_density,
+        )
+        sim = svc.start_simulation(speed=sim_speed)
+        return _jsonable(
+            {
+                "part": part.to_public(),
+                "slice": slice_result.summary(),
+                "simulation": {
+                    "running": sim.running,
+                    "cursor": sim.cursor,
+                    "speed": sim.speed,
+                    "total_moves": len(slice_result.moves),
+                },
+            }
+        )
+
+    @tool
     def upload_stl(name: str, stl_base64: str, ctx: Context, scale: float = 1.0) -> dict:
         """Upload an STL file as base64 bytes. Returns the new part's metadata.
 
@@ -344,13 +434,13 @@ def build_mcp() -> FastMCP:
         part = _svc(ctx).add_part_from_base64(name, stl_base64, scale=scale)
         return _jsonable(part.to_public())
 
-    @mcp.tool
+    @tool
     def set_part_scale(part_id: str, scale: float, ctx: Context) -> dict:
         """Resize a loaded part by a linear scale factor (e.g. 2.0 doubles every dimension)."""
         part = _svc(ctx).set_part_scale(part_id, scale)
         return _jsonable(part.to_public())
 
-    @mcp.tool
+    @tool
     def rotate_part(part_id: str, axis: str, degrees: float, ctx: Context) -> dict:
         """Rotate a part around a world axis ("x", "y", or "z") by `degrees`.
 
@@ -361,13 +451,13 @@ def build_mcp() -> FastMCP:
         part = _svc(ctx).rotate_part(part_id, axis, degrees)
         return _jsonable(part.to_public())
 
-    @mcp.tool
+    @tool
     def reset_part_rotation(part_id: str, ctx: Context) -> dict:
         """Clear all accumulated rotation on `part_id` back to the imported pose."""
         part = _svc(ctx).rotate_part(part_id, "z", 0.0, reset=True)
         return _jsonable(part.to_public())
 
-    @mcp.tool
+    @tool
     def set_part_position(part_id: str, x: float, y: float, ctx: Context) -> dict:
         """Place a part's min-corner at bed (x, y) in mm (clamped to the bed).
 
@@ -378,24 +468,24 @@ def build_mcp() -> FastMCP:
         part = _svc(ctx).set_part_position(part_id, x, y)
         return _jsonable(part.to_public())
 
-    @mcp.tool
+    @tool
     def list_parts(ctx: Context) -> list[dict]:
         """List all loaded parts."""
         return _jsonable([p.to_public() for p in _svc(ctx).parts.values()])
 
-    @mcp.tool
+    @tool
     def remove_part(part_id: str, ctx: Context) -> dict:
         """Remove a part by id."""
         _svc(ctx).remove_part(part_id)
         return _jsonable({"ok": True, "removed": part_id})
 
-    @mcp.tool
+    @tool
     def clear_parts(ctx: Context) -> dict:
         """Remove all parts from the bed."""
         _svc(ctx).clear_parts()
         return _jsonable({"ok": True})
 
-    @mcp.tool
+    @tool
     def auto_arrange(ctx: Context) -> list[dict]:
         """Pack all loaded parts onto the bed using a shelf packer. Returns placements."""
         placements = _svc(ctx).auto_arrange()
@@ -406,7 +496,7 @@ def build_mcp() -> FastMCP:
             ]
         )
 
-    @mcp.tool
+    @tool
     def slice_all(
         ctx: Context,
         layer_height_mm: float = 0.4,
@@ -485,7 +575,7 @@ def build_mcp() -> FastMCP:
         )
         return _jsonable(result.summary())
 
-    @mcp.tool
+    @tool
     def get_gcode(ctx: Context) -> str:
         """Return the latest slice's G-code as a string."""
         svc = _svc(ctx)
@@ -493,7 +583,7 @@ def build_mcp() -> FastMCP:
             raise ValueError("slice first")
         return str(svc.slice_result.gcode)
 
-    @mcp.tool
+    @tool
     def start_simulation(ctx: Context, speed: float = 1.0) -> dict:
         """Start/reset the simulation cursor at 0. Returns simulation state."""
         sim = _svc(ctx).start_simulation(speed=speed)
@@ -505,7 +595,7 @@ def build_mcp() -> FastMCP:
             }
         )
 
-    @mcp.tool
+    @tool
     def step_simulation(ctx: Context, steps: int = 1) -> dict:
         """Advance the simulation cursor by N moves."""
         svc = _svc(ctx)
@@ -519,7 +609,7 @@ def build_mcp() -> FastMCP:
             }
         )
 
-    @mcp.tool
+    @tool
     def set_simulation_cursor(cursor: int, ctx: Context) -> dict:
         """Jump the simulation cursor to a specific move index."""
         svc = _svc(ctx)
@@ -533,12 +623,12 @@ def build_mcp() -> FastMCP:
             }
         )
 
-    @mcp.tool
+    @tool
     def get_simulation_frame(ctx: Context) -> dict:
         """Return the current head position and extruded moves-so-far."""
         return _jsonable(_svc(ctx).get_simulation_frame())
 
-    @mcp.tool
+    @tool
     def focus_viewer(ctx: Context) -> dict:
         """Ask the browser UI to reframe its camera so the loaded parts fill
         ~90% of the viewport. The browser polls for this request, so the
@@ -546,7 +636,7 @@ def build_mcp() -> FastMCP:
         """
         return _jsonable({"focus_request": _svc(ctx).request_focus()})
 
-    @mcp.tool
+    @tool
     def open_viewer(ctx: Context, title: str = "3D Print Simulator") -> dict:
         """Open the live 3D printer viewer in the Atlas canvas panel.
 
