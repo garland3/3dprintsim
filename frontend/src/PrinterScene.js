@@ -11,6 +11,12 @@ import { LineMaterial } from 'three/addons/lines/LineMaterial.js';
 // color ramp. Picked by eye — big enough to read, small enough to stay local.
 const GLOW_SEGMENTS = 40;
 
+// LPBF spark physics — gravity (mm/s²) and the recoater's planar overhang
+// past either edge of the bed (mm). Module-level so they're easy to retune
+// without spelunking through the animation loop.
+const SPARK_GRAVITY = 180;
+const RECOATER_OVERHANG = 8;
+
 // Palette for role-based coloring. The viewer's biggest readability problem is
 // that a single-color toolpath turns into an orange blob — the eye can't parse
 // depth or distinguish structural features. We color by role (perimeter / infill
@@ -929,7 +935,7 @@ export class PrinterScene {
       roughness: 0.35,
       emissive: 0x111418,
     });
-    const bar = new THREE.Mesh(new THREE.BoxGeometry(8, 6, by + 12), mat);
+    const bar = new THREE.Mesh(new THREE.BoxGeometry(8, 6, by + RECOATER_OVERHANG * 1.5), mat);
     bar.name = 'lpbf-recoater';
     return bar;
   }
@@ -966,6 +972,12 @@ export class PrinterScene {
       vz: new Float32Array(capacity),
       life: new Float32Array(capacity),
       maxLife: new Float32Array(capacity),
+      // Initial RGB color recorded at emit time so the per-frame fade can
+      // reproduce the ramp `color = initial * t` instead of compounding
+      // multiplicative decay (which under-shoots into black quickly).
+      r0: new Float32Array(capacity),
+      g0: new Float32Array(capacity),
+      b0: new Float32Array(capacity),
     };
     return points;
   }
@@ -1022,19 +1034,27 @@ export class PrinterScene {
       pos[i * 3 + 0] = headX;
       pos[i * 3 + 1] = 0;
       pos[i * 3 + 2] = headY;
-      // Random upward-and-out velocity (mm/s). Sparks spread in a shallow
-      // cone so they read as splatter rather than smoke.
+      // Random upward cone — `polar` is the angle off the +Y axis, so
+      // small polar = mostly straight up. Cap at ~60° from vertical so
+      // particles never spray sideways or downward.
       const speed = 30 + Math.random() * 60;
       const az = Math.random() * Math.PI * 2;
-      const elev = (Math.PI / 4) + Math.random() * (Math.PI / 3); // mostly upward
-      s.vx[i] = Math.cos(elev) * Math.cos(az) * speed;
-      s.vz[i] = Math.cos(elev) * Math.sin(az) * speed;
-      s.vy[i] = Math.sin(elev) * speed;
+      const polar = Math.random() * (Math.PI / 3); // 0..60° off vertical
+      const horiz = Math.sin(polar) * speed;
+      s.vx[i] = Math.cos(az) * horiz;
+      s.vz[i] = Math.sin(az) * horiz;
+      s.vy[i] = Math.cos(polar) * speed;
       // Hot-yellow → orange. Slight per-particle hue jitter keeps the
       // burst from looking like a single solid blob.
-      col[i * 3 + 0] = 1.0;
-      col[i * 3 + 1] = 0.6 + Math.random() * 0.4;
-      col[i * 3 + 2] = 0.15 + Math.random() * 0.2;
+      const r0 = 1.0;
+      const g0 = 0.6 + Math.random() * 0.4;
+      const b0 = 0.15 + Math.random() * 0.2;
+      s.r0[i] = r0;
+      s.g0[i] = g0;
+      s.b0[i] = b0;
+      col[i * 3 + 0] = r0;
+      col[i * 3 + 1] = g0;
+      col[i * 3 + 2] = b0;
       const life = 0.3 + Math.random() * 0.5;
       s.life[i] = life;
       s.maxLife[i] = life;
@@ -1049,7 +1069,6 @@ export class PrinterScene {
     if (!s || !this._sparks) return;
     const pos = this._sparks.geometry.attributes.position.array;
     const col = this._sparks.geometry.attributes.color.array;
-    const gravity = 180; // mm/s² downward — exaggerated for visual snap
     for (let i = 0; i < s.capacity; i++) {
       if (s.life[i] <= 0) {
         // Fully dim dead slots so the buffer's stale colors don't ghost.
@@ -1058,17 +1077,18 @@ export class PrinterScene {
         col[i * 3 + 2] = 0;
         continue;
       }
-      s.vy[i] -= gravity * dt;
+      s.vy[i] -= SPARK_GRAVITY * dt;
       pos[i * 3 + 0] += s.vx[i] * dt;
       pos[i * 3 + 1] += s.vy[i] * dt;
       pos[i * 3 + 2] += s.vz[i] * dt;
       s.life[i] -= dt;
-      // Fade alpha via color decay since PointsMaterial only takes a single
-      // global opacity. Linear ramp — eye doesn't notice the lack of gamma here.
+      // Linear fade: derive current color from the recorded initial color
+      // each frame. Multiplying the existing color in-place compounds across
+      // frames and crashes to black far faster than `life/maxLife` implies.
       const t = Math.max(0, s.life[i] / s.maxLife[i]);
-      col[i * 3 + 0] *= 0.92 + 0.08 * t;
-      col[i * 3 + 1] *= 0.92 + 0.08 * t;
-      col[i * 3 + 2] *= 0.92 + 0.08 * t;
+      col[i * 3 + 0] = s.r0[i] * t;
+      col[i * 3 + 1] = s.g0[i] * t;
+      col[i * 3 + 2] = s.b0[i] * t;
     }
     this._sparks.geometry.attributes.position.needsUpdate = true;
     this._sparks.geometry.attributes.color.needsUpdate = true;
@@ -1093,8 +1113,8 @@ export class PrinterScene {
     const [bx] = this.bedSize;
     // Sweep left → right across the full bed in ~0.6s. Fast enough that the
     // user sees it on every layer transition without it dominating the sim.
-    const startX = -8;
-    const endX = bx + 8;
+    const startX = -RECOATER_OVERHANG;
+    const endX = bx + RECOATER_OVERHANG;
     // Bar's depth axis is three.js Z (= backend bed Y). Center it on the bed
     // and ride 3mm above the build surface (which sits at world Y=0 in the
     // LPBF view because the printedGroup is sunk by topZ). The bedGroup never
