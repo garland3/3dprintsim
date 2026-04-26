@@ -56,6 +56,11 @@ const ROLE_BASE = {
 };
 const ROLE_DEFAULT = [0.95, 0.42, 0.18];   // fallback to the old orange
 const HOT_COLOR = [1.0, 0.98, 0.75];       // just-extruded glow
+// LPBF "fully cooled" tone — the print should read as a finished metallic
+// part, not as warm filament, once the laser shuts off and the bed cools.
+// Mixed into the role+depth color by (1 - _glowFactor) so it appears
+// gradually during the cooldown and is fully present at the end.
+const LPBF_COOL_COLOR = [0.58, 0.62, 0.70];
 
 // Depth ramp: each segment's base color is biased brighter as Z grows so the
 // eye reads height even on single-role prints. The shift is small (±20% per
@@ -129,6 +134,12 @@ export class PrinterScene {
     this._simEnded = false;
     this._cooldown = null; // null | { t: float in [0,1], duration: seconds }
     this._glowFactor = 1.0;
+    // Cooling-rate multiplier exposed to the React UI. Scales heat-trail
+    // lifetimes and the end-of-sim cooldown duration so the user can dial
+    // the perpetual-glow look down to taste; 2× is a noticeably faster
+    // fade than the physically-truer 1×.
+    this._lpbfCoolingRate = 2.0;
+    this._lpbfCooldownBaseDuration = 2.5;
     this._recoater = null;       // horizontal bar that sweeps each layer
     this._recoaterState = null;  // animation state for the recoater sweep
     this._lpbfClock = null;      // last-frame timestamp for time-step deltas
@@ -838,13 +849,27 @@ export class PrinterScene {
     const zMin = this._zMin ?? 0;
     const zRange = this._zRange ?? 1;
     const glow = this._glowFactor;
+    // In LPBF mode, fade the warm role palette toward a metallic cool tone as
+    // the print cools. coolMix climbs from 0 (mid-print, full role color) to
+    // 1 (fully cooled, near-uniform LPBF_COOL_COLOR). FDM keeps its filament
+    // palette across the run.
+    const coolMix = this._printerType === 'LPBF' ? 1 - glow : 0;
+    const coolR = LPBF_COOL_COLOR[0];
+    const coolG = LPBF_COOL_COLOR[1];
+    const coolB = LPBF_COOL_COLOR[2];
     for (let i = 0; i < visibleSegs; i++) {
       const s = segs[i];
       const o = i * 6;
       pos[o] = s.ax; pos[o + 1] = s.ay; pos[o + 2] = s.az;
       pos[o + 3] = s.bx; pos[o + 4] = s.by; pos[o + 5] = s.bz;
 
-      const base = ROLE_BASE[s.role] || ROLE_DEFAULT;
+      const baseRole = ROLE_BASE[s.role] || ROLE_DEFAULT;
+      // Blend the role color toward the LPBF cool tone before the depth ramp
+      // so depth lighten/darken still applies on top — keeps geometry legible
+      // even when the part has fully cooled to a uniform metallic look.
+      const baseR = baseRole[0] + (coolR - baseRole[0]) * coolMix;
+      const baseG = baseRole[1] + (coolG - baseRole[1]) * coolMix;
+      const baseB = baseRole[2] + (coolB - baseRole[2]) * coolMix;
       // Normalize Z within the toolpath's own range; center at 0.5 so the
       // mid-layers are unshifted and only the ceiling/floor get the extreme
       // tints. shift ∈ [-0.5, +0.5].
@@ -852,9 +877,9 @@ export class PrinterScene {
       const shift = zNorm - 0.5;
       const liftAmt = shift > 0 ? shift * 2 * DEPTH_LIGHTEN : 0;
       const sinkAmt = shift < 0 ? -shift * 2 * DEPTH_DARKEN : 0;
-      let r = base[0] * (1 - sinkAmt) + (1 - base[0]) * liftAmt;
-      let g = base[1] * (1 - sinkAmt) + (1 - base[1]) * liftAmt;
-      let b = base[2] * (1 - sinkAmt) + (1 - base[2]) * liftAmt;
+      let r = baseR * (1 - sinkAmt) + (1 - baseR) * liftAmt;
+      let g = baseG * (1 - sinkAmt) + (1 - baseG) * liftAmt;
+      let b = baseB * (1 - sinkAmt) + (1 - baseB) * liftAmt;
 
       const fromEnd = visibleSegs - 1 - i;
       if (fromEnd < GLOW_SEGMENTS && glow > 0) {
@@ -889,10 +914,11 @@ export class PrinterScene {
 
   _beginCooldown() {
     this._simEnded = true;
-    // 2.5s gives the eye time to read the fade without the user feeling the
-    // sim is hung. Keep the duration in cooldown state so _tickCooldown is
-    // self-contained.
-    this._cooldown = { t: 1.0, duration: 2.5 };
+    // Base duration gives the eye time to read the fade without feeling the
+    // sim is hung; the cooling-rate multiplier shortens it so a user who
+    // dialed faster cooling sees a snappier finish.
+    const duration = this._lpbfCooldownBaseDuration / Math.max(0.1, this._lpbfCoolingRate);
+    this._cooldown = { t: 1.0, duration };
     this._glowFactor = 1.0;
     this._hideLaser();
     this._hideMeltPool();
@@ -920,11 +946,26 @@ export class PrinterScene {
     // hidden and shouldn't come back during the cooldown.
     const built = this._lastVisibleSegsBuilt ?? 0;
     if (built > 0) this._rebuildPrintedGeometry(built);
-    if (c.t <= 0) this._cooldown = null;
+    if (c.t <= 0) {
+      // End of cooldown: drop any heat-trail residue so the part reads as
+      // fully cooled instead of having a few stray glowing dots on top.
+      this._clearHeat();
+      this._cooldown = null;
+    }
   }
 
   setToolpathVisible(visible) {
     this.toolpathGroup.visible = !!visible;
+  }
+
+  // Tunable cooling rate (multiplier; >1 cools faster, <1 cools slower).
+  // Affects heat-trail lifetimes for new emissions and the end-of-sim
+  // cooldown duration. In-flight cooldowns aren't re-pitched mid-fade — the
+  // change takes effect on the next sim run.
+  setLpbfCoolingRate(rate) {
+    const next = Number(rate);
+    if (!isFinite(next) || next <= 0) return;
+    this._lpbfCoolingRate = next;
   }
 
   // Show/hide the translucent source meshes while the simulation is printing.
@@ -1228,39 +1269,14 @@ export class PrinterScene {
   }
 
   _buildLpbfChamber(x, y, z) {
-    // Open well below the bed mouth: four metal walls, a thin frame lip at the
-    // bed plane so the build extents stay readable, and a dim floor at the
-    // bottom so the descent has a defined endpoint instead of opening onto the
-    // background. Depth is sized to the build height plus margin so the deepest
-    // descent never punches through the floor.
+    // Just the rim around the bed mouth — no side walls, no floor. The user
+    // wants to be able to rotate the camera under the part and inspect it
+    // from below; walls and a floor would obstruct that view. The rim lip
+    // alone gives the bed extents a crisp visual reference at Y≈0 so the
+    // descended print stays anchored to a recognizable bed footprint.
     const group = new THREE.Group();
     group.name = 'lpbf-chamber';
-    const depth = z * 1.25 + 20;
 
-    const wallMat = new THREE.MeshStandardMaterial({
-      color: 0x23272d,
-      roughness: 0.55,
-      metalness: 0.4,
-      side: THREE.DoubleSide,
-    });
-    const wallT = 1.5;
-    const walls = [
-      // front (z=0) and back (z=y)
-      { sx: x + wallT * 2, sy: depth, sz: wallT, x: x / 2, z: -wallT / 2 },
-      { sx: x + wallT * 2, sy: depth, sz: wallT, x: x / 2, z: y + wallT / 2 },
-      // left (x=0) and right (x=x)
-      { sx: wallT, sy: depth, sz: y, x: -wallT / 2, z: y / 2 },
-      { sx: wallT, sy: depth, sz: y, x: x + wallT / 2, z: y / 2 },
-    ];
-    for (const w of walls) {
-      const wall = new THREE.Mesh(new THREE.BoxGeometry(w.sx, w.sy, w.sz), wallMat);
-      // Walls hang downward from Y=0; center is at -depth/2.
-      wall.position.set(w.x, -depth / 2, w.z);
-      group.add(wall);
-    }
-
-    // Frame lip at the bed plane — a slim metallic rim around the chamber
-    // mouth so the bed extents stay visually crisp even with the plate hidden.
     const lipMat = new THREE.MeshStandardMaterial({
       color: 0x4d5460,
       metalness: 0.7,
@@ -1280,15 +1296,9 @@ export class PrinterScene {
       group.add(lip);
     }
 
-    // Dim chamber floor — gives the descent a defined bottom rather than
-    // opening into the background void.
-    const floor = new THREE.Mesh(
-      new THREE.BoxGeometry(x, 0.5, y),
-      new THREE.MeshStandardMaterial({ color: 0x0a0c0f, roughness: 0.95 }),
-    );
-    floor.position.set(x / 2, -depth + 0.25, y / 2);
-    group.add(floor);
-
+    // `z` is unused now that walls/floor are gone, but keep the signature so
+    // the existing `setBed(x, y, z)` call site doesn't need to change.
+    void z;
     return group;
   }
 
@@ -1574,7 +1584,11 @@ export class PrinterScene {
     col[i * 3 + 0] = s.r0[i];
     col[i * 3 + 1] = s.g0[i];
     col[i * 3 + 2] = s.b0[i];
-    const life = HEAT_LIFE_MIN + Math.random() * (HEAT_LIFE_MAX - HEAT_LIFE_MIN);
+    // Cooling rate scales lifetime so high-rate values fade heat points
+    // sooner — useful for tight prints where the laser dwells in a small
+    // area and the trail otherwise builds up to a permanent bright glow.
+    const baseLife = HEAT_LIFE_MIN + Math.random() * (HEAT_LIFE_MAX - HEAT_LIFE_MIN);
+    const life = baseLife / Math.max(0.1, this._lpbfCoolingRate);
     s.life[i] = life;
     s.maxLife[i] = life;
     this._heatTrail.geometry.attributes.position.needsUpdate = true;

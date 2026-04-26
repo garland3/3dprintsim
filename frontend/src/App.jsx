@@ -35,6 +35,11 @@ const DEFAULT_PREFS = {
   supportsEnabled: true,
   uploadUnit: 'mm',
   simSpeed: 1,
+  // Default 2× so the LPBF heat trail fades visibly rather than building
+  // up into a permanent glow on tight prints. Users can dial back to 1×
+  // (more physically realistic but harder to read) or up to 4× for
+  // extra-snappy fades.
+  lpbfCoolingRate: 2,
   showToolpath: false,
   // Off by default — the translucent source mesh drowns out the printed
   // filament during sim, which is the whole reason to watch the sim.
@@ -159,6 +164,9 @@ export default function App() {
   const [pending, setPending] = useState({});
   const [showToolpath, setShowToolpath] = useState(initialPrefs.showToolpath);
   const [showPartsDuringSim, setShowPartsDuringSim] = useState(initialPrefs.showPartsDuringSim);
+  const [lpbfCoolingRate, setLpbfCoolingRateState] = useState(
+    initialPrefs.lpbfCoolingRate ?? DEFAULT_PREFS.lpbfCoolingRate,
+  );
   const [sections, setSections] = useState(initialPrefs.sections);
   const [helpOpen, setHelpOpen] = useState(false);
   const [printerPresetName, setPrinterPresetName] = useState('');
@@ -192,6 +200,7 @@ export default function App() {
       supportsEnabled,
       uploadUnit,
       simSpeed: sim.speed,
+      lpbfCoolingRate,
       showToolpath,
       showPartsDuringSim,
       sections,
@@ -202,8 +211,8 @@ export default function App() {
       // Private-mode browsers throw on writes; preferences are non-essential.
     }
   }, [bed, layerHeight, perimeters, infillDensity, topLayers, bottomLayers,
-      supportDensity, supportsEnabled, uploadUnit, sim.speed, showToolpath,
-      showPartsDuringSim, sections]);
+      supportDensity, supportsEnabled, uploadUnit, sim.speed, lpbfCoolingRate,
+      showToolpath, showPartsDuringSim, sections]);
 
   const resetPrefs = useCallback(() => {
     if (!window.confirm('Clear saved UI preferences? Your parts stay on the bed.')) return;
@@ -220,6 +229,7 @@ export default function App() {
     setSim((s) => ({ ...s, speed: DEFAULT_PREFS.simSpeed }));
     setShowToolpath(DEFAULT_PREFS.showToolpath);
     setShowPartsDuringSim(DEFAULT_PREFS.showPartsDuringSim);
+    setLpbfCoolingRateState(DEFAULT_PREFS.lpbfCoolingRate);
     setSections(DEFAULT_PREFS.sections);
     setPrinterPresetName('');
   }, []);
@@ -249,6 +259,10 @@ export default function App() {
     if (!canvasRef.current) return;
     const scene = new PrinterScene(canvasRef.current);
     sceneRef.current = scene;
+    // Push initial prefs that the per-state effects can race against on
+    // first mount (the scene-init effect can win the order, leaving the
+    // initial values unsynced until the user touches the toggle).
+    scene.setLpbfCoolingRate(lpbfCoolingRate);
     scene.onPartDragEnd = async (partId, x, y) => {
       try {
         await api.setPartPosition(partId, x, y);
@@ -423,6 +437,10 @@ export default function App() {
   useEffect(() => {
     if (sceneRef.current) sceneRef.current.setPartsSimVisible(showPartsDuringSim);
   }, [showPartsDuringSim]);
+
+  useEffect(() => {
+    if (sceneRef.current) sceneRef.current.setLpbfCoolingRate(lpbfCoolingRate);
+  }, [lpbfCoolingRate]);
 
   const refreshState = useCallback(async () => {
     try {
@@ -1146,6 +1164,23 @@ export default function App() {
                   title="Jump to layer"
                 />
               </div>
+              {printerType === 'LPBF' && (
+                <div className="row" style={{ marginTop: 8 }}>
+                  <label title="Scales heat-trail lifetime and end-of-sim cooldown.">
+                    Cooling
+                  </label>
+                  <select
+                    value={lpbfCoolingRate}
+                    onChange={(e) => setLpbfCoolingRateState(Number(e.target.value))}
+                    data-testid="lpbf-cooling-rate"
+                  >
+                    <option value="0.5">0.5× (slow)</option>
+                    <option value="1">1× (realistic)</option>
+                    <option value="2">2× (default)</option>
+                    <option value="4">4× (snappy)</option>
+                  </select>
+                </div>
+              )}
               <div className="button-row step-row" data-testid="step-row">
                 <button className="secondary" onClick={() => stepLayer(-1)} disabled={!sliceSummary || isPending('cursor') || layerStarts.length === 0} title="Previous layer ([)" data-testid="step-layer-back">⟪ layer</button>
                 <button className="secondary" onClick={() => stepCursor(-1)} disabled={!sliceSummary || isPending('cursor') || sim.cursor <= 0} title="Previous move (,)" data-testid="step-move-back">‹ step</button>
