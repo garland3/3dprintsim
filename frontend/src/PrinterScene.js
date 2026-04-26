@@ -122,6 +122,13 @@ export class PrinterScene {
     this._meltPool = null;       // additive sprite at the active scan spot
     this._meltPhase = 0;         // pulsing phase (radians) for the melt-pool sprite
     this._activeHead = null;     // last-known scan-spot head; kept fresh by setCursor
+    // End-of-sim cooldown: when the cursor reaches the last move in LPBF mode
+    // we hide the laser/melt pool/sparks immediately and fade the hot-tip
+    // glow on the last GLOW_SEGMENTS over a couple of seconds. _glowFactor
+    // scales the HOT_COLOR contribution in the printed-color rebuild.
+    this._simEnded = false;
+    this._cooldown = null; // null | { t: float in [0,1], duration: seconds }
+    this._glowFactor = 1.0;
     this._recoater = null;       // horizontal bar that sweeps each layer
     this._recoaterState = null;  // animation state for the recoater sweep
     this._lpbfClock = null;      // last-frame timestamp for time-step deltas
@@ -200,6 +207,7 @@ export class PrinterScene {
         this._tickSparks(dt);
         this._tickHeat(dt);
         this._tickRecoater(dt);
+        this._tickCooldown(dt);
       }
       // Melt pool pulses every frame, even when dt is zero (first frame),
       // so the sprite renders the moment LPBF mode starts.
@@ -589,7 +597,11 @@ export class PrinterScene {
       this._sinkOffset = 0;
       this._lastPrintedZ = -Infinity;
       this._lastVisibleSegs = 0;
+      this._lastVisibleSegsBuilt = 0;
       this._activeHead = null;
+      this._simEnded = false;
+      this._cooldown = null;
+      this._glowFactor = 1.0;
       this._hideLaser();
       this._hideMeltPool();
       this._stopRecoaterSweep();
@@ -694,44 +706,6 @@ export class PrinterScene {
       else break;
     }
 
-    // Fill positions + a role-aware, depth-aware color ramp. The last
-    // GLOW_SEGMENTS blend toward a near-white hot color so the active extrusion
-    // stands out. Earlier segments get their role's base color biased by Z
-    // height (lighter at the top, darker at the bottom) — this is what gives
-    // the print visible shape instead of an orange blob.
-    const pos = this._printedPositions;
-    const col = this._printedColors;
-    const zMin = this._zMin ?? 0;
-    const zRange = this._zRange ?? 1;
-    for (let i = 0; i < visibleSegs; i++) {
-      const s = segs[i];
-      const o = i * 6;
-      pos[o] = s.ax; pos[o + 1] = s.ay; pos[o + 2] = s.az;
-      pos[o + 3] = s.bx; pos[o + 4] = s.by; pos[o + 5] = s.bz;
-
-      const base = ROLE_BASE[s.role] || ROLE_DEFAULT;
-      // Normalize Z within the toolpath's own range; center at 0.5 so the
-      // mid-layers are unshifted and only the ceiling/floor get the extreme
-      // tints. shift ∈ [-0.5, +0.5].
-      const zNorm = Math.max(0, Math.min(1, (s.z - zMin) / zRange));
-      const shift = zNorm - 0.5;
-      const liftAmt = shift > 0 ? shift * 2 * DEPTH_LIGHTEN : 0;
-      const sinkAmt = shift < 0 ? -shift * 2 * DEPTH_DARKEN : 0;
-      let r = base[0] * (1 - sinkAmt) + (1 - base[0]) * liftAmt;
-      let g = base[1] * (1 - sinkAmt) + (1 - base[1]) * liftAmt;
-      let b = base[2] * (1 - sinkAmt) + (1 - base[2]) * liftAmt;
-
-      const fromEnd = visibleSegs - 1 - i;
-      if (fromEnd < GLOW_SEGMENTS) {
-        const t = 1 - fromEnd / GLOW_SEGMENTS;
-        r = r + (HOT_COLOR[0] - r) * t;
-        g = g + (HOT_COLOR[1] - g) * t;
-        b = b + (HOT_COLOR[2] - b) * t;
-      }
-      col[o] = r; col[o + 1] = g; col[o + 2] = b;
-      col[o + 3] = r; col[o + 4] = g; col[o + 5] = b;
-    }
-
     // Before any simulation progress the source mesh is the scene — always
     // show it at the upload-time opacity. Once the print starts advancing we
     // honor the `partsSimVisible` flag (defaults off) so the printed filament
@@ -761,21 +735,8 @@ export class PrinterScene {
       }
     }
 
-    this._disposeGroup(this.printedGroup);
-    this.printedGroup.clear();
-    if (visibleSegs > 0 && this._printedMat) {
-      // Fresh allocations so Three.js builds a clean InstancedInterleavedBuffer
-      // for this frame; attempting to swap buffers on an existing
-      // LineSegmentsGeometry produced stale renders in r0.162.
-      const posView = new Float32Array(pos.buffer, pos.byteOffset, visibleSegs * 6);
-      const colView = new Float32Array(col.buffer, col.byteOffset, visibleSegs * 6);
-      const geom = new LineSegmentsGeometry();
-      geom.setPositions(posView);
-      geom.setColors(colView);
-      const lines = new LineSegments2(geom, this._printedMat);
-      this.printedGroup.add(lines);
-    }
-    this._printedVertCount = visibleSegs * 2;
+    this._rebuildPrintedGeometry(visibleSegs);
+    this._lastVisibleSegsBuilt = visibleSegs;
 
     const head = moves[Math.min(cursor, moves.length - 1)];
     if (head) {
@@ -804,44 +765,162 @@ export class PrinterScene {
       this.printedGroup.position.y = -topZ;
       this.partsGroup.position.y = -topZ;
 
-      this._updateLaser(head, topZ);
+      // Detect end-of-simulation transition: the cursor has just reached the
+      // last move, having previously been short of it. Fires once; clears if
+      // the user scrubs back into the run, so re-running a sim works without
+      // a leftover cooled-glow state.
+      const atEnd = cursor >= moves.length && moves.length > 0 && visibleSegs > 0;
+      if (atEnd && !this._simEnded) {
+        this._beginCooldown();
+      } else if (!atEnd && this._simEnded) {
+        // setCursor will rebuild printed geometry below, so _endCooldown only
+        // needs to clear the cooldown state; no rebuild here.
+        this._endCooldown(false);
+      }
 
-      // Detect a layer change to fire the recoater + a spark burst at the
-      // start of the new layer's first segment.
-      if (head && this._lastPrintedZ !== topZ) {
-        if (topZ > this._lastPrintedZ && this._lastPrintedZ !== -Infinity) {
-          this._startRecoaterSweep();
+      if (this._simEnded) {
+        // Laser is off, melt pool gone, sparks cease, heat trail keeps cooling
+        // on its own. Recoater stays in whatever position the last layer left
+        // it (it'll be hidden by _stopRecoaterSweep at end-of-sweep anyway).
+        this._hideLaser();
+        this._hideMeltPool();
+        this._activeHead = null;
+      } else {
+        this._updateLaser(head, topZ);
+        // Detect a layer change to fire the recoater + a spark burst at the
+        // start of the new layer's first segment.
+        if (head && this._lastPrintedZ !== topZ) {
+          if (topZ > this._lastPrintedZ && this._lastPrintedZ !== -Infinity) {
+            this._startRecoaterSweep();
+          }
+          this._lastPrintedZ = topZ;
         }
-        this._lastPrintedZ = topZ;
-      }
-      // Constant low-rate spark emission while a melt is active so the spot
-      // reads as "doing something" even between layer changes.
-      if (head && visibleSegs > 0) {
-        this._emitSparks(head.x, head.y, 4);
-      }
-      // Heat trail: drop a fading point at every newly completed segment's
-      // endpoint. The trail lives on the active surface (world Y=0), so old
-      // marks naturally cool away before the next layer is recoated. Cap how
-      // many we emit per setCursor in case the user scrubs the slider — we
-      // don't want a 100k-segment scrub to enqueue 100k heat points.
-      if (this._heatState && visibleSegs > this._lastVisibleSegs) {
-        const start = this._lastVisibleSegs;
-        const end = Math.min(visibleSegs, start + 64);
-        for (let i = start; i < end; i++) {
-          // segs[i].bx / bz are in three.js coords (X = bed X, Z = bed Y).
-          this._emitHeat(segs[i].bx, segs[i].bz);
+        // Constant low-rate spark emission while a melt is active so the spot
+        // reads as "doing something" even between layer changes.
+        if (head && visibleSegs > 0) {
+          this._emitSparks(head.x, head.y, 4);
         }
+        // Heat trail: drop a fading point at every newly completed segment's
+        // endpoint. The trail lives on the active surface (world Y=0), so old
+        // marks naturally cool away before the next layer is recoated. Cap how
+        // many we emit per setCursor in case the user scrubs the slider — we
+        // don't want a 100k-segment scrub to enqueue 100k heat points.
+        if (this._heatState && visibleSegs > this._lastVisibleSegs) {
+          const start = this._lastVisibleSegs;
+          const end = Math.min(visibleSegs, start + 64);
+          for (let i = start; i < end; i++) {
+            // segs[i].bx / bz are in three.js coords (X = bed X, Z = bed Y).
+            this._emitHeat(segs[i].bx, segs[i].bz);
+          }
+        }
+        // Keep the active scan spot fresh so the melt-pool sprite (driven from
+        // _animate) tracks the laser. Suppress while the sim is at rest (no
+        // segments visible) so we don't park a melt pool over an empty bed.
+        this._activeHead = head && visibleSegs > 0 ? head : null;
       }
-      // Keep the active scan spot fresh so the melt-pool sprite (driven from
-      // _animate) tracks the laser. Suppress while the sim is at rest (no
-      // segments visible) so we don't park a melt pool over an empty bed.
-      this._activeHead = head && visibleSegs > 0 ? head : null;
       this._lastVisibleSegs = visibleSegs;
     } else {
       this._activeHead = null;
       this._lastVisibleSegs = visibleSegs;
     }
     this._lastCursor = cursor;
+  }
+
+  // Fill the printed position+color buffers for `visibleSegs` and rebuild the
+  // LineSegments2 inside printedGroup. Pulled out of setCursor so the LPBF
+  // end-of-sim cooldown can recolor the print (fading the GLOW_SEGMENTS hot
+  // ramp toward zero) without re-running the full setCursor side effects.
+  _rebuildPrintedGeometry(visibleSegs) {
+    const segs = this._extrudeSegments || [];
+    const pos = this._printedPositions;
+    const col = this._printedColors;
+    if (!pos || !col) return;
+    const zMin = this._zMin ?? 0;
+    const zRange = this._zRange ?? 1;
+    const glow = this._glowFactor;
+    for (let i = 0; i < visibleSegs; i++) {
+      const s = segs[i];
+      const o = i * 6;
+      pos[o] = s.ax; pos[o + 1] = s.ay; pos[o + 2] = s.az;
+      pos[o + 3] = s.bx; pos[o + 4] = s.by; pos[o + 5] = s.bz;
+
+      const base = ROLE_BASE[s.role] || ROLE_DEFAULT;
+      // Normalize Z within the toolpath's own range; center at 0.5 so the
+      // mid-layers are unshifted and only the ceiling/floor get the extreme
+      // tints. shift ∈ [-0.5, +0.5].
+      const zNorm = Math.max(0, Math.min(1, (s.z - zMin) / zRange));
+      const shift = zNorm - 0.5;
+      const liftAmt = shift > 0 ? shift * 2 * DEPTH_LIGHTEN : 0;
+      const sinkAmt = shift < 0 ? -shift * 2 * DEPTH_DARKEN : 0;
+      let r = base[0] * (1 - sinkAmt) + (1 - base[0]) * liftAmt;
+      let g = base[1] * (1 - sinkAmt) + (1 - base[1]) * liftAmt;
+      let b = base[2] * (1 - sinkAmt) + (1 - base[2]) * liftAmt;
+
+      const fromEnd = visibleSegs - 1 - i;
+      if (fromEnd < GLOW_SEGMENTS && glow > 0) {
+        // _glowFactor scales the hot mix so the LPBF cooldown can fade the top
+        // of the print from glowing to its base color over a couple of seconds
+        // once the laser has shut off.
+        const t = (1 - fromEnd / GLOW_SEGMENTS) * glow;
+        r = r + (HOT_COLOR[0] - r) * t;
+        g = g + (HOT_COLOR[1] - g) * t;
+        b = b + (HOT_COLOR[2] - b) * t;
+      }
+      col[o] = r; col[o + 1] = g; col[o + 2] = b;
+      col[o + 3] = r; col[o + 4] = g; col[o + 5] = b;
+    }
+
+    this._disposeGroup(this.printedGroup);
+    this.printedGroup.clear();
+    if (visibleSegs > 0 && this._printedMat) {
+      // Fresh allocations so Three.js builds a clean InstancedInterleavedBuffer
+      // for this frame; attempting to swap buffers on an existing
+      // LineSegmentsGeometry produced stale renders in r0.162.
+      const posView = new Float32Array(pos.buffer, pos.byteOffset, visibleSegs * 6);
+      const colView = new Float32Array(col.buffer, col.byteOffset, visibleSegs * 6);
+      const geom = new LineSegmentsGeometry();
+      geom.setPositions(posView);
+      geom.setColors(colView);
+      const lines = new LineSegments2(geom, this._printedMat);
+      this.printedGroup.add(lines);
+    }
+    this._printedVertCount = visibleSegs * 2;
+  }
+
+  _beginCooldown() {
+    this._simEnded = true;
+    // 2.5s gives the eye time to read the fade without the user feeling the
+    // sim is hung. Keep the duration in cooldown state so _tickCooldown is
+    // self-contained.
+    this._cooldown = { t: 1.0, duration: 2.5 };
+    this._glowFactor = 1.0;
+    this._hideLaser();
+    this._hideMeltPool();
+    this._activeHead = null;
+  }
+
+  _endCooldown(restoreGlow) {
+    this._simEnded = false;
+    this._cooldown = null;
+    this._glowFactor = 1.0;
+    if (restoreGlow) {
+      // User scrubbed back into the run — restore the hot tip glow on the new
+      // visible window so it doesn't look frozen-cool until the next setCursor.
+      const built = this._lastVisibleSegsBuilt ?? 0;
+      if (built > 0) this._rebuildPrintedGeometry(built);
+    }
+  }
+
+  _tickCooldown(dt) {
+    const c = this._cooldown;
+    if (!c) return;
+    c.t = Math.max(0, c.t - dt / c.duration);
+    this._glowFactor = c.t;
+    // Re-run only the printed-color rebuild — laser/melt/sparks are already
+    // hidden and shouldn't come back during the cooldown.
+    const built = this._lastVisibleSegsBuilt ?? 0;
+    if (built > 0) this._rebuildPrintedGeometry(built);
+    if (c.t <= 0) this._cooldown = null;
   }
 
   setToolpathVisible(visible) {
@@ -945,6 +1024,9 @@ export class PrinterScene {
       this._lastPrintedZ = -Infinity;
       this._lastVisibleSegs = 0;
       this._activeHead = null;
+      this._simEnded = false;
+      this._cooldown = null;
+      this._glowFactor = 1.0;
       this._hideLaser();
       this._hideMeltPool();
       this._stopRecoaterSweep();
