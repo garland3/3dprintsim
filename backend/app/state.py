@@ -59,6 +59,23 @@ def _is_identity(m: Matrix3) -> bool:
 DEFAULT_BED = (250.0, 210.0, 210.0)
 
 
+# Printer technology being simulated. `FDM` (default) shows a hot-end depositing
+# filament from the bed up; `LPBF` shows a laser fusing powder while the build
+# plate descends. Slicing is shared — only the visualization differs today.
+VALID_PRINTER_TYPES = ("FDM", "LPBF")
+
+
+def _resolve_printer_type() -> str:
+    raw = os.getenv("PRINTER_TYPE", "FDM")
+    normalized = (raw or "").strip().upper()
+    if normalized in VALID_PRINTER_TYPES:
+        return normalized
+    # Anything unrecognized (typo, blank) falls back to FDM rather than
+    # surfacing a hard error — operators should be able to typo their .env
+    # without bricking the server.
+    return "FDM"
+
+
 @dataclass
 class Part:
     id: str
@@ -176,6 +193,10 @@ class PrinterService:
         self._lock = threading.RLock()
         self.session_id = session_id or DEFAULT_SESSION_ID
         self.bed_size: tuple[float, float, float] = DEFAULT_BED
+        # Printer technology — read at service construction so an env override
+        # applied between sessions takes effect on the next session, but the
+        # answer stays stable for the lifetime of any one PrinterService.
+        self.printer_type: str = _resolve_printer_type()
         self.parts: dict[str, Part] = {}
         self.slice_result: SliceResult | None = None
         self.simulation = Simulation()
@@ -526,6 +547,7 @@ class PrinterService:
         with self._lock:
             return {
                 "bed_size": list(self.bed_size),
+                "printer_type": self.printer_type,
                 "parts": [p.to_public() for p in self.parts.values()],
                 "slice": self.slice_result.summary() if self.slice_result else None,
                 "simulation": self.simulation.to_public(

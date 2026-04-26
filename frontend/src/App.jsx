@@ -162,6 +162,9 @@ export default function App() {
   const [sections, setSections] = useState(initialPrefs.sections);
   const [helpOpen, setHelpOpen] = useState(false);
   const [printerPresetName, setPrinterPresetName] = useState('');
+  // Printer technology — 'FDM' or 'LPBF'. Set by the backend from the .env
+  // file; the frontend just reflects whatever the server reports.
+  const [printerType, setPrinterType] = useState('FDM');
   // Synchronous mirror of `pending`. React's setPending is async/batched, so a
   // guard that reads the state-updater closure can miss a rapid re-entrant
   // click. The ref gives us an immediate lockout before we kick off `fn`.
@@ -423,6 +426,9 @@ export default function App() {
       setBed({ x: st.bed_size[0], y: st.bed_size[1], z: st.bed_size[2] });
       setParts(st.parts);
       setSliceSummary(st.slice);
+      const nextPrinterType = (st.printer_type || 'FDM').toUpperCase();
+      setPrinterType(nextPrinterType);
+      if (sceneRef.current) sceneRef.current.setPrinterType(nextPrinterType);
       setSim((s) => ({
         ...s,
         // Don't let a backend refresh clobber a client-side simulation in
@@ -747,11 +753,19 @@ export default function App() {
         <Section
           id="bed"
           title="Bed"
-          aside={`${bed.x}×${bed.y}×${bed.z}`}
+          aside={`${printerType} · ${bed.x}×${bed.y}×${bed.z}`}
           open={sections.bed}
           onToggle={toggleSection}
           testid="section-bed"
         >
+          <div className="row" data-testid="printer-type-row">
+            <label>Printer</label>
+            <span data-testid="printer-type">
+              {printerType === 'LPBF'
+                ? 'LPBF (Laser Powder Bed Fusion)'
+                : 'FDM (Fused Deposition Modeling)'}
+            </span>
+          </div>
           <div className="row">
             <label>Preset</label>
             <select

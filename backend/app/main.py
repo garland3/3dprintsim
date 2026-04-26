@@ -299,7 +299,10 @@ def create_app() -> FastAPI:
     app = FastAPI(
         title="3dprintsim",
         version="0.1.0",
-        description="Virtual FDM printer simulator with stateful per-session MCP support.",
+        description=(
+            "Virtual 3D printer simulator with stateful per-session MCP support. "
+            "Visualizes FDM (default) or LPBF printing — set `PRINTER_TYPE` in .env."
+        ),
         lifespan=lifespan,
     )
 

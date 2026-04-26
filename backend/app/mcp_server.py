@@ -337,7 +337,7 @@ def build_mcp() -> FastMCP:
 
     @tool
     def get_printer_state(ctx: Context) -> dict:
-        """Return bed size, loaded parts, slice summary, and simulation cursor."""
+        """Return printer type (FDM/LPBF), bed size, parts, slice, simulation cursor."""
         return _jsonable(_svc(ctx).get_state())
 
     @tool

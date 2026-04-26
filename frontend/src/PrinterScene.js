@@ -73,6 +73,19 @@ export class PrinterScene {
     this.scene.add(this.head);
     this.head.visible = false;
 
+    // LPBF rigging — built lazily so FDM renders aren't paying the cost.
+    // `_printerType` switches the renderer between FDM (default; build-up)
+    // and LPBF (build-plate-descends, laser fuses powder, recoater sweeps).
+    this._printerType = 'FDM';
+    this._laser = null;          // overhead laser source + beam line
+    this._sparks = null;         // THREE.Points used as transient sparks
+    this._sparkState = null;     // per-particle velocity / lifetime arrays
+    this._recoater = null;       // horizontal bar that sweeps each layer
+    this._recoaterState = null;  // animation state for the recoater sweep
+    this._lpbfClock = null;      // last-frame timestamp for time-step deltas
+    this._sinkOffset = 0;        // current "build plate has descended" mm
+    this._lastPrintedZ = -Infinity; // tracks the active layer for recoater triggers
+
     // simple orbit: LMB=rotate, wheel=zoom, shift+LMB or RMB=pan.
     // Must be initialized before setBed(), which reads _orbit.target.
     this._orbit = { azimuth: Math.PI / 4, polar: Math.PI / 3, radius: 500, target: new THREE.Vector3() };
@@ -131,6 +144,15 @@ export class PrinterScene {
   };
 
   _animate = () => {
+    if (this._printerType === 'LPBF') {
+      const now = performance.now();
+      const dt = this._lpbfClock == null ? 0 : Math.min(0.1, (now - this._lpbfClock) / 1000);
+      this._lpbfClock = now;
+      if (dt > 0) {
+        this._tickSparks(dt);
+        this._tickRecoater(dt);
+      }
+    }
     this.renderer.render(this.scene, this.camera);
     this._raf = requestAnimationFrame(this._animate);
   };
@@ -372,6 +394,18 @@ export class PrinterScene {
     this._orbit.target.set(x / 2, z / 4, y / 2);
     this._orbit.radius = Math.max(x, y) * 2;
     this._applyOrbit();
+
+    // The LPBF recoater spans the bed depth — rebuild it whenever the bed
+    // resizes so it doesn't end up clipping or overshooting the new volume.
+    if (this._recoater) {
+      this.scene.remove(this._recoater);
+      this._recoater.geometry.dispose();
+      this._recoater.material.dispose();
+      this._recoater = this._buildRecoater();
+      this.scene.add(this._recoater);
+      this._recoater.visible = false;
+      this._recoaterState = null;
+    }
   }
 
   _buildAxesGizmo(size) {
@@ -480,6 +514,14 @@ export class PrinterScene {
       // mesh during printing" flag that setCursor sets — otherwise newly
       // uploaded parts render invisible until the user scrubs back to 0.
       this.partsGroup.visible = true;
+      // Reset the LPBF descent so a fresh upload doesn't render under the bed
+      // because the previous run had sunk the column.
+      this.printedGroup.position.y = 0;
+      this.partsGroup.position.y = 0;
+      this._sinkOffset = 0;
+      this._lastPrintedZ = -Infinity;
+      this._hideLaser();
+      this._stopRecoaterSweep();
       this._ghostMat = null;
       this._printedMat = null;
       this._printedPositions = null;
@@ -558,7 +600,9 @@ export class PrinterScene {
     this._printedMat.resolution.set(resW, resH);
     this._printedVertCount = 0;
 
-    this.head.visible = true;
+    // FDM shows the nozzle cone; LPBF replaces it with the laser rig and
+    // hides the cone (the active spot is rendered by the laser beam instead).
+    this.head.visible = this._printerType !== 'LPBF';
     this.setCursor(0);
   }
 
@@ -667,6 +711,43 @@ export class PrinterScene {
       // poised just over the last deposited segment instead of buried in it.
       this.head.position.set(head.x, head.z + 0.5, head.y);
     }
+
+    // LPBF visualization layer — plays on top of the same printed/parts
+    // geometry the FDM render uses. We compute the topmost printed Z, drop
+    // the build plate by that amount (so the active layer always sits at the
+    // recoater level), aim the laser at the active spot, and trigger a
+    // recoater sweep + spark burst whenever a new layer starts.
+    if (this._printerType === 'LPBF') {
+      // Topmost printed-layer Z (the "active build surface"). Falls back to 0
+      // before any segments have been deposited so the part starts flush.
+      let topZ = 0;
+      for (let i = 0; i < visibleSegs; i++) {
+        const z = segs[i].z;
+        if (z > topZ) topZ = z;
+      }
+      this._sinkOffset = topZ;
+      // Push the printed material and the source-mesh ghost down by the
+      // current build-plate descent. The bedGroup stays put — that's the
+      // machine frame; only the powder column sinks.
+      this.printedGroup.position.y = -topZ;
+      this.partsGroup.position.y = -topZ;
+
+      this._updateLaser(head, topZ);
+
+      // Detect a layer change to fire the recoater + a spark burst at the
+      // start of the new layer's first segment.
+      if (head && this._lastPrintedZ !== topZ) {
+        if (topZ > this._lastPrintedZ && this._lastPrintedZ !== -Infinity) {
+          this._startRecoaterSweep();
+        }
+        this._lastPrintedZ = topZ;
+      }
+      // Constant low-rate spark emission while a melt is active so the spot
+      // reads as "doing something" even between layer changes.
+      if (head && visibleSegs > 0) {
+        this._emitSparks(head.x, head.y, 4);
+      }
+    }
     this._lastCursor = cursor;
   }
 
@@ -739,6 +820,309 @@ export class PrinterScene {
       head: this.head.visible
         ? [this.head.position.x, this.head.position.y, this.head.position.z]
         : null,
+      printerType: this._printerType,
+      sinkOffset: this._sinkOffset || 0,
+      laserVisible: !!(this._laser && this._laser.visible),
+      recoaterActive: !!(this._recoaterState && this._recoaterState.active),
     };
+  }
+
+  // ---- LPBF visualization ----------------------------------------------
+
+  // Switch the visualization to FDM (build-up) or LPBF (build-plate-descends).
+  // Idempotent — calling with the current type is a no-op so React's
+  // setState-driven calls don't churn the scene.
+  setPrinterType(type) {
+    const next = (type || 'FDM').toString().toUpperCase() === 'LPBF' ? 'LPBF' : 'FDM';
+    if (next === this._printerType) return;
+    this._printerType = next;
+    if (next === 'LPBF') {
+      this._ensureLpbfRig();
+      // The FDM nozzle cone makes no sense over a powder bed.
+      this.head.visible = false;
+    } else {
+      // Reverting to FDM — undo any descent and put the laser/recoater away.
+      this.printedGroup.position.y = 0;
+      this.partsGroup.position.y = 0;
+      this._sinkOffset = 0;
+      this._lastPrintedZ = -Infinity;
+      this._hideLaser();
+      this._stopRecoaterSweep();
+      this._clearSparks();
+      // Restore the head if a toolpath is loaded so the FDM nozzle reappears.
+      if (this._moves && this._moves.length > 0) this.head.visible = true;
+    }
+    // Replay the last cursor so the new visualization snaps into place
+    // without waiting for the next sim tick.
+    if (this._moves && this._moves.length > 0) {
+      this.setCursor(this._lastCursor || 0);
+    }
+  }
+
+  _ensureLpbfRig() {
+    if (!this._laser) {
+      this._laser = this._buildLaser();
+      this.scene.add(this._laser);
+    }
+    if (!this._recoater) {
+      this._recoater = this._buildRecoater();
+      this.scene.add(this._recoater);
+      this._recoater.visible = false;
+    }
+    if (!this._sparks) {
+      this._sparks = this._buildSparks();
+      this.scene.add(this._sparks);
+    }
+  }
+
+  _buildLaser() {
+    // Laser source: a small box high above the bed that "emits" a thin
+    // bright line down to the active scan point. The beam is a separate
+    // child so we can stretch/aim it without touching the source mesh.
+    const group = new THREE.Group();
+    group.name = 'lpbf-laser';
+
+    const sourceMat = new THREE.MeshStandardMaterial({
+      color: 0x222222,
+      emissive: 0x442000,
+      metalness: 0.7,
+      roughness: 0.4,
+    });
+    const source = new THREE.Mesh(new THREE.BoxGeometry(20, 14, 20), sourceMat);
+    source.name = 'laser-source';
+    group.add(source);
+
+    // Beam — a thin cylinder along +Y so we can scale Y to the desired length.
+    const beamMat = new THREE.MeshBasicMaterial({
+      color: 0xff5522,
+      transparent: true,
+      opacity: 0.55,
+      depthWrite: false,
+    });
+    const beam = new THREE.Mesh(new THREE.CylinderGeometry(0.6, 0.6, 1, 8, 1, true), beamMat);
+    beam.name = 'laser-beam';
+    // Origin at the top of the cylinder; positioned so its base is at -Y.
+    beam.geometry.translate(0, -0.5, 0);
+    group.add(beam);
+    group.userData.beam = beam;
+    group.userData.source = source;
+
+    // A bright point light at the active spot adds the visual "flash" that
+    // pure additive line geometry can't deliver on its own.
+    const flash = new THREE.PointLight(0xffaa44, 0.0, 60, 2.0);
+    flash.name = 'laser-flash';
+    group.add(flash);
+    group.userData.flash = flash;
+
+    group.visible = false;
+    return group;
+  }
+
+  _buildRecoater() {
+    // A flat metallic bar that spans the bed's depth (Y axis in the backend
+    // frame, which is +Z in three.js). It rides at the build surface (Y=0
+    // after the printedGroup sinks) and translates along +X across the bed.
+    const [bx, , by] = this.bedSize;
+    const mat = new THREE.MeshStandardMaterial({
+      color: 0x9aa0aa,
+      metalness: 0.85,
+      roughness: 0.35,
+      emissive: 0x111418,
+    });
+    const bar = new THREE.Mesh(new THREE.BoxGeometry(8, 6, by + 12), mat);
+    bar.name = 'lpbf-recoater';
+    return bar;
+  }
+
+  _buildSparks() {
+    // Capacity picked so a ~30Hz emission rate over a few seconds doesn't
+    // wrap before the oldest particles have faded — small enough to keep
+    // the overdraw negligible.
+    const capacity = 256;
+    const positions = new Float32Array(capacity * 3);
+    const colors = new Float32Array(capacity * 3);
+    const geom = new THREE.BufferGeometry();
+    geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geom.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+    geom.setDrawRange(0, 0);
+    const mat = new THREE.PointsMaterial({
+      size: 2.5,
+      vertexColors: true,
+      transparent: true,
+      opacity: 0.95,
+      depthWrite: false,
+      sizeAttenuation: true,
+    });
+    const points = new THREE.Points(geom, mat);
+    points.name = 'lpbf-sparks';
+    points.frustumCulled = false;
+    this._sparkState = {
+      capacity,
+      cursor: 0,
+      live: 0,
+      // Per-particle velocity (mm/s) and remaining lifetime (s).
+      vx: new Float32Array(capacity),
+      vy: new Float32Array(capacity),
+      vz: new Float32Array(capacity),
+      life: new Float32Array(capacity),
+      maxLife: new Float32Array(capacity),
+    };
+    return points;
+  }
+
+  _hideLaser() {
+    if (this._laser) {
+      this._laser.visible = false;
+      const flash = this._laser.userData.flash;
+      if (flash) flash.intensity = 0;
+    }
+  }
+
+  _updateLaser(headMove, topZ) {
+    if (!this._laser) return;
+    if (!headMove) {
+      this._hideLaser();
+      return;
+    }
+    // The build surface always sits at world Y=0 in the LPBF view (the
+    // printedGroup is translated down by `topZ` so the active layer is at 0).
+    const surfaceY = 0;
+    // Source hovers a fixed distance above the build surface, anchored over
+    // the active scan spot so the beam reads as straight-down.
+    const sourceY = Math.max(60, this.bedSize[2] * 0.45);
+    this._laser.visible = true;
+    this._laser.position.set(headMove.x, sourceY, headMove.y);
+
+    const beam = this._laser.userData.beam;
+    if (beam) {
+      // Beam stretches from the source down to the surface — local +Y points
+      // up, so a negative scaleY plus the geometry's translated origin draws
+      // it downward.
+      const length = Math.max(1, sourceY - surfaceY);
+      beam.scale.set(1, length, 1);
+    }
+    const flash = this._laser.userData.flash;
+    if (flash) {
+      flash.position.set(0, -(sourceY - surfaceY), 0);
+      flash.intensity = 1.4;
+    }
+  }
+
+  _emitSparks(headX, headY, count) {
+    const s = this._sparkState;
+    if (!s || !this._sparks) return;
+    const pos = this._sparks.geometry.attributes.position.array;
+    const col = this._sparks.geometry.attributes.color.array;
+    for (let n = 0; n < count; n++) {
+      const i = s.cursor;
+      s.cursor = (s.cursor + 1) % s.capacity;
+      if (s.live < s.capacity) s.live += 1;
+      // Spawn at the active spot in world coords. Build surface is at Y=0
+      // because the printedGroup is sunk by topZ in LPBF mode.
+      pos[i * 3 + 0] = headX;
+      pos[i * 3 + 1] = 0;
+      pos[i * 3 + 2] = headY;
+      // Random upward-and-out velocity (mm/s). Sparks spread in a shallow
+      // cone so they read as splatter rather than smoke.
+      const speed = 30 + Math.random() * 60;
+      const az = Math.random() * Math.PI * 2;
+      const elev = (Math.PI / 4) + Math.random() * (Math.PI / 3); // mostly upward
+      s.vx[i] = Math.cos(elev) * Math.cos(az) * speed;
+      s.vz[i] = Math.cos(elev) * Math.sin(az) * speed;
+      s.vy[i] = Math.sin(elev) * speed;
+      // Hot-yellow → orange. Slight per-particle hue jitter keeps the
+      // burst from looking like a single solid blob.
+      col[i * 3 + 0] = 1.0;
+      col[i * 3 + 1] = 0.6 + Math.random() * 0.4;
+      col[i * 3 + 2] = 0.15 + Math.random() * 0.2;
+      const life = 0.3 + Math.random() * 0.5;
+      s.life[i] = life;
+      s.maxLife[i] = life;
+    }
+    this._sparks.geometry.setDrawRange(0, s.capacity);
+    this._sparks.geometry.attributes.position.needsUpdate = true;
+    this._sparks.geometry.attributes.color.needsUpdate = true;
+  }
+
+  _tickSparks(dt) {
+    const s = this._sparkState;
+    if (!s || !this._sparks) return;
+    const pos = this._sparks.geometry.attributes.position.array;
+    const col = this._sparks.geometry.attributes.color.array;
+    const gravity = 180; // mm/s² downward — exaggerated for visual snap
+    for (let i = 0; i < s.capacity; i++) {
+      if (s.life[i] <= 0) {
+        // Fully dim dead slots so the buffer's stale colors don't ghost.
+        col[i * 3 + 0] = 0;
+        col[i * 3 + 1] = 0;
+        col[i * 3 + 2] = 0;
+        continue;
+      }
+      s.vy[i] -= gravity * dt;
+      pos[i * 3 + 0] += s.vx[i] * dt;
+      pos[i * 3 + 1] += s.vy[i] * dt;
+      pos[i * 3 + 2] += s.vz[i] * dt;
+      s.life[i] -= dt;
+      // Fade alpha via color decay since PointsMaterial only takes a single
+      // global opacity. Linear ramp — eye doesn't notice the lack of gamma here.
+      const t = Math.max(0, s.life[i] / s.maxLife[i]);
+      col[i * 3 + 0] *= 0.92 + 0.08 * t;
+      col[i * 3 + 1] *= 0.92 + 0.08 * t;
+      col[i * 3 + 2] *= 0.92 + 0.08 * t;
+    }
+    this._sparks.geometry.attributes.position.needsUpdate = true;
+    this._sparks.geometry.attributes.color.needsUpdate = true;
+  }
+
+  _clearSparks() {
+    const s = this._sparkState;
+    if (!s || !this._sparks) return;
+    const pos = this._sparks.geometry.attributes.position.array;
+    const col = this._sparks.geometry.attributes.color.array;
+    pos.fill(0);
+    col.fill(0);
+    s.life.fill(0);
+    s.live = 0;
+    s.cursor = 0;
+    this._sparks.geometry.attributes.position.needsUpdate = true;
+    this._sparks.geometry.attributes.color.needsUpdate = true;
+  }
+
+  _startRecoaterSweep() {
+    if (!this._recoater) return;
+    const [bx] = this.bedSize;
+    // Sweep left → right across the full bed in ~0.6s. Fast enough that the
+    // user sees it on every layer transition without it dominating the sim.
+    const startX = -8;
+    const endX = bx + 8;
+    // Bar's depth axis is three.js Z (= backend bed Y). Center it on the bed
+    // and ride 3mm above the build surface (which sits at world Y=0 in the
+    // LPBF view because the printedGroup is sunk by topZ). The bedGroup never
+    // sinks, so the recoater stays in the machine frame regardless of descent.
+    this._recoater.position.set(startX, 3, this.bedSize[1] / 2);
+    this._recoater.visible = true;
+    this._recoaterState = {
+      active: true,
+      startX,
+      endX,
+      x: startX,
+      speed: (endX - startX) / 0.6, // mm/s
+    };
+  }
+
+  _tickRecoater(dt) {
+    const r = this._recoaterState;
+    if (!r || !r.active || !this._recoater) return;
+    r.x += r.speed * dt;
+    if (r.x >= r.endX) {
+      this._stopRecoaterSweep();
+      return;
+    }
+    this._recoater.position.x = r.x;
+  }
+
+  _stopRecoaterSweep() {
+    if (this._recoater) this._recoater.visible = false;
+    if (this._recoaterState) this._recoaterState.active = false;
   }
 }

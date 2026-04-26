@@ -46,6 +46,30 @@ def test_default_bed_size(client: TestClient):
     assert r.json()["bed_size"] == [250.0, 210.0, 210.0]
 
 
+def test_default_printer_type_is_fdm(client: TestClient):
+    r = client.get("/api/state")
+    assert r.json()["printer_type"] == "FDM"
+
+
+def test_printer_type_env_override(monkeypatch):
+    """`PRINTER_TYPE=LPBF` in the environment switches new sessions to LPBF."""
+    monkeypatch.setenv("PRINTER_TYPE", "lpbf")
+    reset_service()
+    app = create_app()
+    with TestClient(app) as c:
+        assert c.get("/api/state").json()["printer_type"] == "LPBF"
+    reset_service()
+
+
+def test_printer_type_invalid_falls_back_to_fdm(monkeypatch):
+    monkeypatch.setenv("PRINTER_TYPE", "bogus")
+    reset_service()
+    app = create_app()
+    with TestClient(app) as c:
+        assert c.get("/api/state").json()["printer_type"] == "FDM"
+    reset_service()
+
+
 def test_set_bed_size(client: TestClient):
     r = client.post("/api/bed", json={"x": 200, "y": 200, "z": 200})
     assert r.status_code == 200
