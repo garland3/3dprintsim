@@ -35,6 +35,11 @@ const DEFAULT_PREFS = {
   supportsEnabled: true,
   uploadUnit: 'mm',
   simSpeed: 1,
+  // Default 2× so the LPBF heat trail fades visibly rather than building
+  // up into a permanent glow on tight prints. Users can dial back to 1×
+  // (more physically realistic but harder to read) or up to 4× for
+  // extra-snappy fades.
+  lpbfCoolingRate: 2,
   showToolpath: false,
   // Off by default — the translucent source mesh drowns out the printed
   // filament during sim, which is the whole reason to watch the sim.
@@ -159,13 +164,23 @@ export default function App() {
   const [pending, setPending] = useState({});
   const [showToolpath, setShowToolpath] = useState(initialPrefs.showToolpath);
   const [showPartsDuringSim, setShowPartsDuringSim] = useState(initialPrefs.showPartsDuringSim);
+  const [lpbfCoolingRate, setLpbfCoolingRateState] = useState(
+    initialPrefs.lpbfCoolingRate ?? DEFAULT_PREFS.lpbfCoolingRate,
+  );
   const [sections, setSections] = useState(initialPrefs.sections);
   const [helpOpen, setHelpOpen] = useState(false);
   const [printerPresetName, setPrinterPresetName] = useState('');
+  // Printer technology — 'FDM' or 'LPBF'. Set by the backend from the .env
+  // file; the frontend just reflects whatever the server reports.
+  const [printerType, setPrinterType] = useState('FDM');
   // Synchronous mirror of `pending`. React's setPending is async/batched, so a
   // guard that reads the state-updater closure can miss a rapid re-entrant
   // click. The ref gives us an immediate lockout before we kick off `fn`.
   const pendingRef = useRef({});
+  // One-shot guard so we only auto-slow the playback the first time LPBF
+  // mode loads in this session. Subsequent setSpeed calls (manual or via
+  // resetPrefs) leave the user's choice alone.
+  const lpbfSpeedSnappedRef = useRef(false);
 
   const toggleSection = useCallback((id) => {
     setSections((prev) => ({ ...prev, [id]: !prev[id] }));
@@ -185,6 +200,7 @@ export default function App() {
       supportsEnabled,
       uploadUnit,
       simSpeed: sim.speed,
+      lpbfCoolingRate,
       showToolpath,
       showPartsDuringSim,
       sections,
@@ -195,8 +211,8 @@ export default function App() {
       // Private-mode browsers throw on writes; preferences are non-essential.
     }
   }, [bed, layerHeight, perimeters, infillDensity, topLayers, bottomLayers,
-      supportDensity, supportsEnabled, uploadUnit, sim.speed, showToolpath,
-      showPartsDuringSim, sections]);
+      supportDensity, supportsEnabled, uploadUnit, sim.speed, lpbfCoolingRate,
+      showToolpath, showPartsDuringSim, sections]);
 
   const resetPrefs = useCallback(() => {
     if (!window.confirm('Clear saved UI preferences? Your parts stay on the bed.')) return;
@@ -213,6 +229,7 @@ export default function App() {
     setSim((s) => ({ ...s, speed: DEFAULT_PREFS.simSpeed }));
     setShowToolpath(DEFAULT_PREFS.showToolpath);
     setShowPartsDuringSim(DEFAULT_PREFS.showPartsDuringSim);
+    setLpbfCoolingRateState(DEFAULT_PREFS.lpbfCoolingRate);
     setSections(DEFAULT_PREFS.sections);
     setPrinterPresetName('');
   }, []);
@@ -242,6 +259,10 @@ export default function App() {
     if (!canvasRef.current) return;
     const scene = new PrinterScene(canvasRef.current);
     sceneRef.current = scene;
+    // Push initial prefs that the per-state effects can race against on
+    // first mount (the scene-init effect can win the order, leaving the
+    // initial values unsynced until the user touches the toggle).
+    scene.setLpbfCoolingRate(lpbfCoolingRate);
     scene.onPartDragEnd = async (partId, x, y) => {
       try {
         await api.setPartPosition(partId, x, y);
@@ -417,23 +438,46 @@ export default function App() {
     if (sceneRef.current) sceneRef.current.setPartsSimVisible(showPartsDuringSim);
   }, [showPartsDuringSim]);
 
+  useEffect(() => {
+    if (sceneRef.current) sceneRef.current.setLpbfCoolingRate(lpbfCoolingRate);
+  }, [lpbfCoolingRate]);
+
   const refreshState = useCallback(async () => {
     try {
       const st = await api.state();
       setBed({ x: st.bed_size[0], y: st.bed_size[1], z: st.bed_size[2] });
       setParts(st.parts);
       setSliceSummary(st.slice);
-      setSim((s) => ({
-        ...s,
-        // Don't let a backend refresh clobber a client-side simulation in
-        // flight; the local RAF loop is authoritative while running.
-        running: s.running ? s.running : st.simulation.running,
-        cursor: s.running ? s.cursor : st.simulation.cursor,
-        total: st.simulation.total_moves,
-        // Keep the user's speed choice authoritative on the frontend; the
-        // backend only ever receives it at /simulation/start time.
-        speed: s.speed,
-      }));
+      const nextPrinterType = (st.printer_type || 'FDM').toUpperCase();
+      setPrinterType(nextPrinterType);
+      if (sceneRef.current) sceneRef.current.setPrinterType(nextPrinterType);
+      setSim((s) => {
+        // First time we see LPBF in this session, drop the playback speed if
+        // the user is still on the FDM-friendly 1× default — LPBF prints have
+        // tens of thousands of short scan moves and the visual richness
+        // (laser, heat trail, recoater) is unreadable at that pace. The user
+        // can override with the speed dropdown at any time.
+        let nextSpeed = s.speed;
+        if (
+          nextPrinterType === 'LPBF' &&
+          !lpbfSpeedSnappedRef.current &&
+          (s.speed === 1 || s.speed === '1')
+        ) {
+          nextSpeed = 0.25;
+          lpbfSpeedSnappedRef.current = true;
+        }
+        return {
+          ...s,
+          // Don't let a backend refresh clobber a client-side simulation in
+          // flight; the local RAF loop is authoritative while running.
+          running: s.running ? s.running : st.simulation.running,
+          cursor: s.running ? s.cursor : st.simulation.cursor,
+          total: st.simulation.total_moves,
+          // Keep the user's speed choice authoritative on the frontend; the
+          // backend only ever receives it at /simulation/start time.
+          speed: nextSpeed,
+        };
+      });
       if (sceneRef.current) sceneRef.current.setBed(st.bed_size[0], st.bed_size[1], st.bed_size[2]);
     } catch (e) {
       setError(String(e));
@@ -613,7 +657,11 @@ export default function App() {
     const total = sim.total;
     const start = performance.now();
     const startCursor = sim.cursor;
-    const movesPerSec = Math.max(50, total / 10) * (sim.speed || 1);
+    // Default cadence ≈ 10 s for the whole print, but the floor is intentionally
+    // low (5 mvs/sec) so 0.05× / 0.1× actually slow LPBF prints down enough to
+    // see the laser traverse each scan line, the heat trail cool, and the
+    // recoater sweep instead of skipping past in a couple of frames.
+    const movesPerSec = Math.max(5, total / 10) * (sim.speed || 1);
     let rafId;
     const step = (now) => {
       const elapsed = (now - start) / 1000;
@@ -747,11 +795,19 @@ export default function App() {
         <Section
           id="bed"
           title="Bed"
-          aside={`${bed.x}×${bed.y}×${bed.z}`}
+          aside={`${printerType} · ${bed.x}×${bed.y}×${bed.z}`}
           open={sections.bed}
           onToggle={toggleSection}
           testid="section-bed"
         >
+          <div className="row" data-testid="printer-type-row">
+            <label>Printer</label>
+            <span data-testid="printer-type">
+              {printerType === 'LPBF'
+                ? 'LPBF (Laser Powder Bed Fusion)'
+                : 'FDM (Fused Deposition Modeling)'}
+            </span>
+          </div>
           <div className="row">
             <label>Preset</label>
             <select
@@ -1088,6 +1144,8 @@ export default function App() {
                   onChange={(e) => setSpeed(e.target.value)}
                   data-testid="sim-speed"
                 >
+                  <option value="0.05">0.05×</option>
+                  <option value="0.1">0.1×</option>
                   <option value="0.25">0.25×</option>
                   <option value="0.5">0.5×</option>
                   <option value="1">1×</option>
@@ -1106,6 +1164,23 @@ export default function App() {
                   title="Jump to layer"
                 />
               </div>
+              {printerType === 'LPBF' && (
+                <div className="row" style={{ marginTop: 8 }}>
+                  <label title="Scales heat-trail lifetime and end-of-sim cooldown.">
+                    Cooling
+                  </label>
+                  <select
+                    value={lpbfCoolingRate}
+                    onChange={(e) => setLpbfCoolingRateState(Number(e.target.value))}
+                    data-testid="lpbf-cooling-rate"
+                  >
+                    <option value="0.5">0.5× (slow)</option>
+                    <option value="1">1× (realistic)</option>
+                    <option value="2">2× (default)</option>
+                    <option value="4">4× (snappy)</option>
+                  </select>
+                </div>
+              )}
               <div className="button-row step-row" data-testid="step-row">
                 <button className="secondary" onClick={() => stepLayer(-1)} disabled={!sliceSummary || isPending('cursor') || layerStarts.length === 0} title="Previous layer ([)" data-testid="step-layer-back">⟪ layer</button>
                 <button className="secondary" onClick={() => stepCursor(-1)} disabled={!sliceSummary || isPending('cursor') || sim.cursor <= 0} title="Previous move (,)" data-testid="step-move-back">‹ step</button>

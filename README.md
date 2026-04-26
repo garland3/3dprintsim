@@ -2,9 +2,18 @@
 
 ![A virtual FDM print mid-simulation — thick glowing orange filament fills the lower layers, sparse rectilinear infill is visible through the top, and the print head hovers over the next layer](docs/screenshots/10-hero-infill-closeup.png)
 
-Virtual FDM printer simulator. Upload STLs, auto-arrange on the bed, slice into
+Virtual 3D printer simulator. Upload STLs, auto-arrange on the bed, slice into
 perimeters + infill + solid top/bottom layers, and watch the simulated print
 head build each layer as thick, glowing filament.
+
+Two printer technologies can be visualized — pick one with `PRINTER_TYPE` in
+`.env`:
+
+- **`FDM`** (default): a hot-end deposits glowing filament from the bed up.
+- **`LPBF`**: a laser fuses metal powder layer-by-layer; the build plate
+  descends, a recoater bar sweeps across the bed at every new layer, and
+  sparks fly from the active scan point. Slicing is shared with FDM today —
+  only the visualization changes.
 
 Three ways to drive it:
 
