@@ -6,6 +6,9 @@ import * as THREE from 'three';
 import { LineSegments2 } from 'three/addons/lines/LineSegments2.js';
 import { LineSegmentsGeometry } from 'three/addons/lines/LineSegmentsGeometry.js';
 import { LineMaterial } from 'three/addons/lines/LineMaterial.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 
 // Number of most-recent extrude segments that get the "hot / freshly extruded"
 // color ramp. Picked by eye — big enough to read, small enough to stay local.
@@ -75,6 +78,16 @@ export class PrinterScene {
     this.camera.position.set(400, 300, 400);
     this.camera.lookAt(0, 0, 0);
 
+    // Bloom postprocessing — gives the laser, sparks, melt pool, and heat
+    // trail an actual self-illumination glow instead of a flat sprite. The
+    // composer is rebuilt-in-place on resize via _resize().
+    // Threshold is intentionally loose (0.55) so the orange/amber palette
+    // bleeds; strength + radius dialed by eye against the dark background.
+    this.composer = new EffectComposer(this.renderer);
+    this.composer.addPass(new RenderPass(this.scene, this.camera));
+    this.bloomPass = new UnrealBloomPass(new THREE.Vector2(1, 1), 0.65, 0.6, 0.55);
+    this.composer.addPass(this.bloomPass);
+
     this.scene.add(new THREE.AmbientLight(0xffffff, 0.5));
     const dir = new THREE.DirectionalLight(0xffffff, 0.7);
     dir.position.set(200, 400, 200);
@@ -106,6 +119,9 @@ export class PrinterScene {
     this._sparkState = null;     // per-particle velocity / lifetime arrays
     this._heatTrail = null;      // THREE.Points used for melt-pool heat fade
     this._heatState = null;      // per-point lifetime + initial color arrays
+    this._meltPool = null;       // additive sprite at the active scan spot
+    this._meltPhase = 0;         // pulsing phase (radians) for the melt-pool sprite
+    this._activeHead = null;     // last-known scan-spot head; kept fresh by setCursor
     this._recoater = null;       // horizontal bar that sweeps each layer
     this._recoaterState = null;  // animation state for the recoater sweep
     this._lpbfClock = null;      // last-frame timestamp for time-step deltas
@@ -144,6 +160,7 @@ export class PrinterScene {
     }
     this._disposeGroup(this.toolpathGroup);
     this._disposeGroup(this.printedGroup);
+    if (this.composer) this.composer.dispose();
     this.renderer.dispose();
   }
 
@@ -168,6 +185,10 @@ export class PrinterScene {
     // LineMaterial needs the viewport resolution to compute pixel line widths.
     if (this._ghostMat) this._ghostMat.resolution.set(w, h);
     if (this._printedMat) this._printedMat.resolution.set(w, h);
+    // EffectComposer keeps its own framebuffers — must be resized in lockstep
+    // with the renderer or the bloom output stretches/blurs incorrectly.
+    if (this.composer) this.composer.setSize(w, h);
+    if (this.bloomPass) this.bloomPass.setSize(w, h);
   };
 
   _animate = () => {
@@ -180,8 +201,15 @@ export class PrinterScene {
         this._tickHeat(dt);
         this._tickRecoater(dt);
       }
+      // Melt pool pulses every frame, even when dt is zero (first frame),
+      // so the sprite renders the moment LPBF mode starts.
+      this._updateMeltPool(this._activeHead, dt);
     }
-    this.renderer.render(this.scene, this.camera);
+    if (this.composer) {
+      this.composer.render();
+    } else {
+      this.renderer.render(this.scene, this.camera);
+    }
     this._raf = requestAnimationFrame(this._animate);
   };
 
@@ -561,7 +589,9 @@ export class PrinterScene {
       this._sinkOffset = 0;
       this._lastPrintedZ = -Infinity;
       this._lastVisibleSegs = 0;
+      this._activeHead = null;
       this._hideLaser();
+      this._hideMeltPool();
       this._stopRecoaterSweep();
       this._clearHeat();
       this._ghostMat = null;
@@ -802,8 +832,13 @@ export class PrinterScene {
           this._emitHeat(segs[i].bx, segs[i].bz);
         }
       }
+      // Keep the active scan spot fresh so the melt-pool sprite (driven from
+      // _animate) tracks the laser. Suppress while the sim is at rest (no
+      // segments visible) so we don't park a melt pool over an empty bed.
+      this._activeHead = head && visibleSegs > 0 ? head : null;
       this._lastVisibleSegs = visibleSegs;
     } else {
+      this._activeHead = null;
       this._lastVisibleSegs = visibleSegs;
     }
     this._lastCursor = cursor;
@@ -909,7 +944,9 @@ export class PrinterScene {
       this._sinkOffset = 0;
       this._lastPrintedZ = -Infinity;
       this._lastVisibleSegs = 0;
+      this._activeHead = null;
       this._hideLaser();
+      this._hideMeltPool();
       this._stopRecoaterSweep();
       this._clearSparks();
       this._clearHeat();
@@ -942,6 +979,10 @@ export class PrinterScene {
     if (!this._heatTrail) {
       this._heatTrail = this._buildHeatTrail();
       this.scene.add(this._heatTrail);
+    }
+    if (!this._meltPool) {
+      this._meltPool = this._buildMeltPool();
+      this.scene.add(this._meltPool);
     }
   }
 
@@ -1048,26 +1089,47 @@ export class PrinterScene {
     lens.position.set(0, -8, 0);
     gimbal.add(lens);
 
-    // Beam — a thin tapered cylinder along beam-local -Y. We scale Y at runtime
-    // to match the lens-to-spot distance. Cylinder geometry runs along Y by
-    // default; translating the geometry so y∈[0,-1] keeps the top anchored at
-    // beam.position (the lens) and lets a positive scaleY extend it downward.
-    const beamMat = new THREE.MeshBasicMaterial({
-      color: 0xff5522,
+    // Volumetric beam: a thin bright core inside a wider soft halo. Both run
+    // along beam-local -Y and are scaled in Y at runtime to span lens→spot.
+    // Cylinder geometry runs along Y by default; translating so y∈[0,-1] keeps
+    // the top anchored at beam.position (the lens) and lets a positive scaleY
+    // extend it downward.
+    //
+    // Bloom does the heavy lifting on the glow — these meshes only need to
+    // contribute the right shape; the postprocessing pass blooms them out.
+    const coreMat = new THREE.MeshBasicMaterial({
+      color: 0xfff2c0,
       transparent: true,
-      opacity: 0.75,
+      opacity: 0.95,
       depthWrite: false,
       blending: THREE.AdditiveBlending,
     });
-    const beam = new THREE.Mesh(new THREE.CylinderGeometry(0.7, 0.25, 1, 10), beamMat);
-    beam.name = 'laser-beam';
-    beam.geometry.translate(0, -0.5, 0);
-    beam.position.set(0, -8, 0); // anchored at the lens
-    gimbal.add(beam);
+    const beamCore = new THREE.Mesh(new THREE.CylinderGeometry(0.45, 0.18, 1, 12), coreMat);
+    beamCore.name = 'laser-beam-core';
+    beamCore.geometry.translate(0, -0.5, 0);
+    beamCore.position.set(0, -8, 0);
+    gimbal.add(beamCore);
+
+    const haloMat = new THREE.MeshBasicMaterial({
+      color: 0xff7a33,
+      transparent: true,
+      opacity: 0.22,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+    });
+    const beamHalo = new THREE.Mesh(new THREE.CylinderGeometry(2.2, 0.9, 1, 14), haloMat);
+    beamHalo.name = 'laser-beam-halo';
+    beamHalo.geometry.translate(0, -0.5, 0);
+    beamHalo.position.set(0, -8, 0);
+    gimbal.add(beamHalo);
 
     group.userData.gimbal = gimbal;
     group.userData.lens = lens;
-    group.userData.beam = beam;
+    // `beam` is consumed by _updateLaser to set length; we point it at the
+    // core and have _updateLaser sync the halo's scale alongside it via
+    // userData.beamHalo.
+    group.userData.beam = beamCore;
+    group.userData.beamHalo = beamHalo;
     // Cache the lens's local Y inside the gimbal so _updateLaser can compute
     // the gimbal-to-spot distance and subtract this offset to size the beam.
     group.userData.lensLocalY = -8;
@@ -1262,6 +1324,8 @@ export class PrinterScene {
         // dist - |lensLocalY|.
         const beamLen = Math.max(1, dist - Math.abs(lensLocalY));
         beam.scale.set(1, beamLen, 1);
+        const halo = this._laser.userData.beamHalo;
+        if (halo) halo.scale.set(1, beamLen, 1);
       }
     }
 
@@ -1485,6 +1549,68 @@ export class PrinterScene {
     s.cursor = 0;
     this._heatTrail.geometry.attributes.position.needsUpdate = true;
     this._heatTrail.geometry.attributes.color.needsUpdate = true;
+  }
+
+  _buildMeltPool() {
+    // Radial-gradient billboard sprite that sits at the active scan spot. The
+    // sprite is screen-aligned (Sprite, not Mesh) so it always faces the
+    // camera, and it uses additive blending so bloom can grab it. The texture
+    // is painted once on a 64×64 canvas — the gradient does the work.
+    const canvas = document.createElement('canvas');
+    canvas.width = 64;
+    canvas.height = 64;
+    const ctx = canvas.getContext('2d');
+    const grad = ctx.createRadialGradient(32, 32, 0, 32, 32, 32);
+    grad.addColorStop(0.00, 'rgba(255, 255, 240, 1.0)');
+    grad.addColorStop(0.18, 'rgba(255, 220, 140, 0.95)');
+    grad.addColorStop(0.45, 'rgba(255, 130, 50, 0.6)');
+    grad.addColorStop(0.75, 'rgba(180, 40, 10, 0.18)');
+    grad.addColorStop(1.00, 'rgba(0, 0, 0, 0)');
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, 64, 64);
+    const tex = new THREE.CanvasTexture(canvas);
+    tex.anisotropy = 4;
+    const mat = new THREE.SpriteMaterial({
+      map: tex,
+      transparent: true,
+      depthWrite: false,
+      depthTest: false,
+      blending: THREE.AdditiveBlending,
+    });
+    const sprite = new THREE.Sprite(mat);
+    sprite.name = 'lpbf-melt-pool';
+    sprite.scale.set(8, 8, 1);
+    // renderOrder so the sprite draws after the printed lines (depthTest is
+    // off, but a high renderOrder also keeps it ordered correctly with the
+    // heat-trail Points).
+    sprite.renderOrder = 12;
+    sprite.visible = false;
+    return sprite;
+  }
+
+  _updateMeltPool(headMove, dt) {
+    if (!this._meltPool) return;
+    if (!headMove) {
+      this._meltPool.visible = false;
+      return;
+    }
+    // Sit just above the build surface (Y=0.1 in world) to avoid z-fighting
+    // with the heat-trail Points, then pulse scale + opacity to suggest a
+    // boiling melt pool. dt may be 0 on the first frame; default to a small
+    // step so the phase advances.
+    this._meltPhase += (dt > 0 ? dt : 0.016) * 9.0;
+    const pulse = 0.5 + 0.5 * Math.sin(this._meltPhase);
+    const scale = 7 + pulse * 3.5;
+    this._meltPool.position.set(headMove.x, 0.1, headMove.y);
+    this._meltPool.scale.set(scale, scale, 1);
+    if (this._meltPool.material) {
+      this._meltPool.material.opacity = 0.75 + pulse * 0.25;
+    }
+    this._meltPool.visible = true;
+  }
+
+  _hideMeltPool() {
+    if (this._meltPool) this._meltPool.visible = false;
   }
 
   _startRecoaterSweep() {

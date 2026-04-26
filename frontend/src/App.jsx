@@ -169,6 +169,10 @@ export default function App() {
   // guard that reads the state-updater closure can miss a rapid re-entrant
   // click. The ref gives us an immediate lockout before we kick off `fn`.
   const pendingRef = useRef({});
+  // One-shot guard so we only auto-slow the playback the first time LPBF
+  // mode loads in this session. Subsequent setSpeed calls (manual or via
+  // resetPrefs) leave the user's choice alone.
+  const lpbfSpeedSnappedRef = useRef(false);
 
   const toggleSection = useCallback((id) => {
     setSections((prev) => ({ ...prev, [id]: !prev[id] }));
@@ -429,17 +433,33 @@ export default function App() {
       const nextPrinterType = (st.printer_type || 'FDM').toUpperCase();
       setPrinterType(nextPrinterType);
       if (sceneRef.current) sceneRef.current.setPrinterType(nextPrinterType);
-      setSim((s) => ({
-        ...s,
-        // Don't let a backend refresh clobber a client-side simulation in
-        // flight; the local RAF loop is authoritative while running.
-        running: s.running ? s.running : st.simulation.running,
-        cursor: s.running ? s.cursor : st.simulation.cursor,
-        total: st.simulation.total_moves,
-        // Keep the user's speed choice authoritative on the frontend; the
-        // backend only ever receives it at /simulation/start time.
-        speed: s.speed,
-      }));
+      setSim((s) => {
+        // First time we see LPBF in this session, drop the playback speed if
+        // the user is still on the FDM-friendly 1× default — LPBF prints have
+        // tens of thousands of short scan moves and the visual richness
+        // (laser, heat trail, recoater) is unreadable at that pace. The user
+        // can override with the speed dropdown at any time.
+        let nextSpeed = s.speed;
+        if (
+          nextPrinterType === 'LPBF' &&
+          !lpbfSpeedSnappedRef.current &&
+          (s.speed === 1 || s.speed === '1')
+        ) {
+          nextSpeed = 0.25;
+          lpbfSpeedSnappedRef.current = true;
+        }
+        return {
+          ...s,
+          // Don't let a backend refresh clobber a client-side simulation in
+          // flight; the local RAF loop is authoritative while running.
+          running: s.running ? s.running : st.simulation.running,
+          cursor: s.running ? s.cursor : st.simulation.cursor,
+          total: st.simulation.total_moves,
+          // Keep the user's speed choice authoritative on the frontend; the
+          // backend only ever receives it at /simulation/start time.
+          speed: nextSpeed,
+        };
+      });
       if (sceneRef.current) sceneRef.current.setBed(st.bed_size[0], st.bed_size[1], st.bed_size[2]);
     } catch (e) {
       setError(String(e));
@@ -619,7 +639,11 @@ export default function App() {
     const total = sim.total;
     const start = performance.now();
     const startCursor = sim.cursor;
-    const movesPerSec = Math.max(50, total / 10) * (sim.speed || 1);
+    // Default cadence ≈ 10 s for the whole print, but the floor is intentionally
+    // low (5 mvs/sec) so 0.05× / 0.1× actually slow LPBF prints down enough to
+    // see the laser traverse each scan line, the heat trail cool, and the
+    // recoater sweep instead of skipping past in a couple of frames.
+    const movesPerSec = Math.max(5, total / 10) * (sim.speed || 1);
     let rafId;
     const step = (now) => {
       const elapsed = (now - start) / 1000;
@@ -1102,6 +1126,8 @@ export default function App() {
                   onChange={(e) => setSpeed(e.target.value)}
                   data-testid="sim-speed"
                 >
+                  <option value="0.05">0.05×</option>
+                  <option value="0.1">0.1×</option>
                   <option value="0.25">0.25×</option>
                   <option value="0.5">0.5×</option>
                   <option value="1">1×</option>
