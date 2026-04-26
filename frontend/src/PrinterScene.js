@@ -17,6 +17,24 @@ const GLOW_SEGMENTS = 40;
 const SPARK_GRAVITY = 180;
 const RECOATER_OVERHANG = 8;
 
+// Off-screen sentinel for dead particles in pooled THREE.Points buffers.
+// We move retired slots far below the scene rather than relying on a black
+// vertex color, because PointsMaterial still rasterizes a (0,0,0) point as a
+// faint dot against the dark background.
+const PARTICLE_SINK_Y = -1e5;
+
+// LPBF heat-trail visualization. Each newly completed scan segment drops a
+// heat point at its endpoint that fades white-yellow → orange → red → off.
+const HEAT_TRAIL_CAPACITY = 768;
+const HEAT_LIFE_MIN = 1.2;
+const HEAT_LIFE_MAX = 2.4;
+
+// Module-level scratch objects so the per-frame laser/gimbal math doesn't
+// allocate on every aim update.
+const _v0 = new THREE.Vector3();
+const _v1 = new THREE.Vector3();
+const _q0 = new THREE.Quaternion();
+
 // Palette for role-based coloring. The viewer's biggest readability problem is
 // that a single-color toolpath turns into an orange blob — the eye can't parse
 // depth or distinguish structural features. We color by role (perimeter / infill
@@ -86,11 +104,14 @@ export class PrinterScene {
     this._laser = null;          // overhead laser source + beam line
     this._sparks = null;         // THREE.Points used as transient sparks
     this._sparkState = null;     // per-particle velocity / lifetime arrays
+    this._heatTrail = null;      // THREE.Points used for melt-pool heat fade
+    this._heatState = null;      // per-point lifetime + initial color arrays
     this._recoater = null;       // horizontal bar that sweeps each layer
     this._recoaterState = null;  // animation state for the recoater sweep
     this._lpbfClock = null;      // last-frame timestamp for time-step deltas
     this._sinkOffset = 0;        // current "build plate has descended" mm
     this._lastPrintedZ = -Infinity; // tracks the active layer for recoater triggers
+    this._lastVisibleSegs = 0;   // last setCursor()'s visibleSegs — drives heat emit
 
     // simple orbit: LMB=rotate, wheel=zoom, shift+LMB or RMB=pan.
     // Must be initialized before setBed(), which reads _orbit.target.
@@ -156,6 +177,7 @@ export class PrinterScene {
       this._lpbfClock = now;
       if (dt > 0) {
         this._tickSparks(dt);
+        this._tickHeat(dt);
         this._tickRecoater(dt);
       }
     }
@@ -378,7 +400,19 @@ export class PrinterScene {
       new THREE.MeshStandardMaterial({ color: 0x1a1f25, roughness: 0.9 }),
     );
     plate.position.set(x / 2, -0.5, y / 2);
+    plate.name = 'bed-plate';
+    this._bedPlate = plate;
+    // In LPBF mode the plate would hide the descending build column, so it's
+    // swapped for a chamber (walls + lip + dim floor) below.
+    plate.visible = this._printerType !== 'LPBF';
     this.bedGroup.add(plate);
+
+    // LPBF build chamber: an open well below the bed mouth so the descending
+    // column of melted powder is visible. Pre-built and toggled with the
+    // printer type so FDM doesn't pay the geometry cost while it's hidden.
+    this._lpbfChamber = this._buildLpbfChamber(x, y, z);
+    this._lpbfChamber.visible = this._printerType === 'LPBF';
+    this.bedGroup.add(this._lpbfChamber);
 
     const grid = new THREE.GridHelper(Math.max(x, y), Math.max(x, y) / 10, 0x2a313a, 0x1a1f25);
     grid.position.set(x / 2, 0.01, y / 2);
@@ -526,8 +560,10 @@ export class PrinterScene {
       this.partsGroup.position.y = 0;
       this._sinkOffset = 0;
       this._lastPrintedZ = -Infinity;
+      this._lastVisibleSegs = 0;
       this._hideLaser();
       this._stopRecoaterSweep();
+      this._clearHeat();
       this._ghostMat = null;
       this._printedMat = null;
       this._printedPositions = null;
@@ -753,6 +789,22 @@ export class PrinterScene {
       if (head && visibleSegs > 0) {
         this._emitSparks(head.x, head.y, 4);
       }
+      // Heat trail: drop a fading point at every newly completed segment's
+      // endpoint. The trail lives on the active surface (world Y=0), so old
+      // marks naturally cool away before the next layer is recoated. Cap how
+      // many we emit per setCursor in case the user scrubs the slider — we
+      // don't want a 100k-segment scrub to enqueue 100k heat points.
+      if (this._heatState && visibleSegs > this._lastVisibleSegs) {
+        const start = this._lastVisibleSegs;
+        const end = Math.min(visibleSegs, start + 64);
+        for (let i = start; i < end; i++) {
+          // segs[i].bx / bz are in three.js coords (X = bed X, Z = bed Y).
+          this._emitHeat(segs[i].bx, segs[i].bz);
+        }
+      }
+      this._lastVisibleSegs = visibleSegs;
+    } else {
+      this._lastVisibleSegs = visibleSegs;
     }
     this._lastCursor = cursor;
   }
@@ -846,15 +898,23 @@ export class PrinterScene {
       this._ensureLpbfRig();
       // The FDM nozzle cone makes no sense over a powder bed.
       this.head.visible = false;
+      // Hide the solid plate and expose the chamber so the descending column
+      // of printed material is visible below the bed mouth.
+      if (this._bedPlate) this._bedPlate.visible = false;
+      if (this._lpbfChamber) this._lpbfChamber.visible = true;
     } else {
       // Reverting to FDM — undo any descent and put the laser/recoater away.
       this.printedGroup.position.y = 0;
       this.partsGroup.position.y = 0;
       this._sinkOffset = 0;
       this._lastPrintedZ = -Infinity;
+      this._lastVisibleSegs = 0;
       this._hideLaser();
       this._stopRecoaterSweep();
       this._clearSparks();
+      this._clearHeat();
+      if (this._bedPlate) this._bedPlate.visible = true;
+      if (this._lpbfChamber) this._lpbfChamber.visible = false;
       // Restore the head if a toolpath is loaded so the FDM nozzle reappears.
       if (this._moves && this._moves.length > 0) this.head.visible = true;
     }
@@ -879,48 +939,212 @@ export class PrinterScene {
       this._sparks = this._buildSparks();
       this.scene.add(this._sparks);
     }
+    if (!this._heatTrail) {
+      this._heatTrail = this._buildHeatTrail();
+      this.scene.add(this._heatTrail);
+    }
   }
 
   _buildLaser() {
-    // Laser source: a small box high above the bed that "emits" a thin
-    // bright line down to the active scan point. The beam is a separate
-    // child so we can stretch/aim it without touching the source mesh.
+    // Stationary scanner head: the housing sits at a fixed point above the bed
+    // center, and only the lower gimbal rotates to aim the beam at the active
+    // scan spot. This matches a real galvanometer laser system, where the body
+    // is bolted to the chamber and only the mirror assembly tilts.
+    //
+    // Hierarchy:
+    //   group (positioned over bed center)
+    //   ├── housing (fixed metal box with stripe + indicator LED)
+    //   ├── ringMount (decorative torus where the gimbal pivots)
+    //   ├── gimbal (rotates so its local -Y aims at the spot)
+    //   │   ├── lensHousing (cylinder)
+    //   │   ├── lens (glowing aperture)
+    //   │   └── beam (cylinder along local -Y, scaled to spot distance)
+    //   └── flash (PointLight, repositioned each frame to the spot)
     const group = new THREE.Group();
     group.name = 'lpbf-laser';
 
-    const sourceMat = new THREE.MeshStandardMaterial({
-      color: 0x222222,
-      emissive: 0x442000,
+    const housingMat = new THREE.MeshStandardMaterial({
+      color: 0x1a1d22,
+      metalness: 0.85,
+      roughness: 0.35,
+    });
+    const housing = new THREE.Mesh(new THREE.BoxGeometry(44, 22, 32), housingMat);
+    housing.name = 'laser-housing';
+    group.add(housing);
+
+    // Accent stripe so the housing reads as a real piece of equipment rather
+    // than a featureless block.
+    const accentMat = new THREE.MeshStandardMaterial({
+      color: 0x9a2a2a,
+      emissive: 0x5a1010,
+      emissiveIntensity: 0.7,
       metalness: 0.7,
       roughness: 0.4,
     });
-    const source = new THREE.Mesh(new THREE.BoxGeometry(20, 14, 20), sourceMat);
-    source.name = 'laser-source';
-    group.add(source);
+    const stripe = new THREE.Mesh(new THREE.BoxGeometry(44.4, 2.4, 6), accentMat);
+    stripe.position.set(0, 4, 0);
+    group.add(stripe);
 
-    // Beam — a thin cylinder along +Y so we can scale Y to the desired length.
+    // Status LED — a tiny green sphere on the housing corner.
+    const led = new THREE.Mesh(
+      new THREE.SphereGeometry(0.9, 12, 8),
+      new THREE.MeshBasicMaterial({ color: 0x55ff66 }),
+    );
+    led.position.set(17, 4, 14);
+    group.add(led);
+
+    // Mounting collar / cooling fins on the underside — purely cosmetic.
+    const collarMat = new THREE.MeshStandardMaterial({
+      color: 0x2a2e34,
+      metalness: 0.9,
+      roughness: 0.3,
+    });
+    const collar = new THREE.Mesh(new THREE.CylinderGeometry(9, 11, 4, 24), collarMat);
+    collar.position.set(0, -13, 0);
+    group.add(collar);
+
+    // Decorative torus where the gimbal nests — sits at the gimbal's pivot.
+    const ringMat = new THREE.MeshStandardMaterial({
+      color: 0x444a52,
+      metalness: 0.9,
+      roughness: 0.25,
+    });
+    const ring = new THREE.Mesh(new THREE.TorusGeometry(7.5, 1.2, 10, 28), ringMat);
+    ring.position.set(0, -16, 0);
+    ring.rotation.x = Math.PI / 2;
+    group.add(ring);
+
+    // Inner gimbal — rotates so its local -Y points at the active spot. All
+    // beam-aiming geometry lives under this group so we can drive the entire
+    // assembly with a single quaternion.
+    const gimbal = new THREE.Group();
+    gimbal.name = 'laser-gimbal';
+    gimbal.position.set(0, -16, 0);
+    group.add(gimbal);
+
+    // Lens housing — the conical scanner tube the beam emerges from.
+    const lensHousing = new THREE.Mesh(
+      new THREE.CylinderGeometry(5.5, 4.0, 8, 20),
+      new THREE.MeshStandardMaterial({
+        color: 0x2c3036,
+        metalness: 0.9,
+        roughness: 0.25,
+      }),
+    );
+    lensHousing.position.set(0, -4, 0);
+    gimbal.add(lensHousing);
+
+    // Visible glowing aperture at the bottom of the lens housing.
+    const lens = new THREE.Mesh(
+      new THREE.CylinderGeometry(3.6, 3.6, 0.7, 24),
+      new THREE.MeshStandardMaterial({
+        color: 0xff6633,
+        emissive: 0xff4422,
+        emissiveIntensity: 1.4,
+        metalness: 0.1,
+        roughness: 0.2,
+      }),
+    );
+    lens.position.set(0, -8, 0);
+    gimbal.add(lens);
+
+    // Beam — a thin tapered cylinder along beam-local -Y. We scale Y at runtime
+    // to match the lens-to-spot distance. Cylinder geometry runs along Y by
+    // default; translating the geometry so y∈[0,-1] keeps the top anchored at
+    // beam.position (the lens) and lets a positive scaleY extend it downward.
     const beamMat = new THREE.MeshBasicMaterial({
       color: 0xff5522,
       transparent: true,
-      opacity: 0.55,
+      opacity: 0.75,
       depthWrite: false,
+      blending: THREE.AdditiveBlending,
     });
-    const beam = new THREE.Mesh(new THREE.CylinderGeometry(0.6, 0.6, 1, 8, 1, true), beamMat);
+    const beam = new THREE.Mesh(new THREE.CylinderGeometry(0.7, 0.25, 1, 10), beamMat);
     beam.name = 'laser-beam';
-    // Origin at the top of the cylinder; positioned so its base is at -Y.
     beam.geometry.translate(0, -0.5, 0);
-    group.add(beam);
-    group.userData.beam = beam;
-    group.userData.source = source;
+    beam.position.set(0, -8, 0); // anchored at the lens
+    gimbal.add(beam);
 
-    // A bright point light at the active spot adds the visual "flash" that
-    // pure additive line geometry can't deliver on its own.
-    const flash = new THREE.PointLight(0xffaa44, 0.0, 60, 2.0);
+    group.userData.gimbal = gimbal;
+    group.userData.lens = lens;
+    group.userData.beam = beam;
+    // Cache the lens's local Y inside the gimbal so _updateLaser can compute
+    // the gimbal-to-spot distance and subtract this offset to size the beam.
+    group.userData.lensLocalY = -8;
+
+    // Bright point light at the active spot, repositioned in the laser-local
+    // frame each frame so it tracks the scan head.
+    const flash = new THREE.PointLight(0xffaa44, 0.0, 80, 2.0);
     flash.name = 'laser-flash';
     group.add(flash);
     group.userData.flash = flash;
 
     group.visible = false;
+    return group;
+  }
+
+  _buildLpbfChamber(x, y, z) {
+    // Open well below the bed mouth: four metal walls, a thin frame lip at the
+    // bed plane so the build extents stay readable, and a dim floor at the
+    // bottom so the descent has a defined endpoint instead of opening onto the
+    // background. Depth is sized to the build height plus margin so the deepest
+    // descent never punches through the floor.
+    const group = new THREE.Group();
+    group.name = 'lpbf-chamber';
+    const depth = z * 1.25 + 20;
+
+    const wallMat = new THREE.MeshStandardMaterial({
+      color: 0x23272d,
+      roughness: 0.55,
+      metalness: 0.4,
+      side: THREE.DoubleSide,
+    });
+    const wallT = 1.5;
+    const walls = [
+      // front (z=0) and back (z=y)
+      { sx: x + wallT * 2, sy: depth, sz: wallT, x: x / 2, z: -wallT / 2 },
+      { sx: x + wallT * 2, sy: depth, sz: wallT, x: x / 2, z: y + wallT / 2 },
+      // left (x=0) and right (x=x)
+      { sx: wallT, sy: depth, sz: y, x: -wallT / 2, z: y / 2 },
+      { sx: wallT, sy: depth, sz: y, x: x + wallT / 2, z: y / 2 },
+    ];
+    for (const w of walls) {
+      const wall = new THREE.Mesh(new THREE.BoxGeometry(w.sx, w.sy, w.sz), wallMat);
+      // Walls hang downward from Y=0; center is at -depth/2.
+      wall.position.set(w.x, -depth / 2, w.z);
+      group.add(wall);
+    }
+
+    // Frame lip at the bed plane — a slim metallic rim around the chamber
+    // mouth so the bed extents stay visually crisp even with the plate hidden.
+    const lipMat = new THREE.MeshStandardMaterial({
+      color: 0x4d5460,
+      metalness: 0.7,
+      roughness: 0.45,
+    });
+    const lipH = 0.8;
+    const lipW = 4;
+    const lipDefs = [
+      { sx: x + lipW * 2, sz: lipW, x: x / 2, z: -lipW / 2 },
+      { sx: x + lipW * 2, sz: lipW, x: x / 2, z: y + lipW / 2 },
+      { sx: lipW, sz: y, x: -lipW / 2, z: y / 2 },
+      { sx: lipW, sz: y, x: x + lipW / 2, z: y / 2 },
+    ];
+    for (const l of lipDefs) {
+      const lip = new THREE.Mesh(new THREE.BoxGeometry(l.sx, lipH, l.sz), lipMat);
+      lip.position.set(l.x, lipH / 2, l.z);
+      group.add(lip);
+    }
+
+    // Dim chamber floor — gives the descent a defined bottom rather than
+    // opening into the background void.
+    const floor = new THREE.Mesh(
+      new THREE.BoxGeometry(x, 0.5, y),
+      new THREE.MeshStandardMaterial({ color: 0x0a0c0f, roughness: 0.95 }),
+    );
+    floor.position.set(x / 2, -depth + 0.25, y / 2);
+    group.add(floor);
+
     return group;
   }
 
@@ -947,10 +1171,13 @@ export class PrinterScene {
     const capacity = 256;
     const positions = new Float32Array(capacity * 3);
     const colors = new Float32Array(capacity * 3);
+    // Sink every slot off-screen so idle particles never render at the bed
+    // origin as faint black dots before they've ever been emitted.
+    for (let i = 0; i < capacity; i++) positions[i * 3 + 1] = PARTICLE_SINK_Y;
     const geom = new THREE.BufferGeometry();
     geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
     geom.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-    geom.setDrawRange(0, 0);
+    geom.setDrawRange(0, capacity);
     const mat = new THREE.PointsMaterial({
       size: 2.5,
       vertexColors: true,
@@ -996,27 +1223,54 @@ export class PrinterScene {
       this._hideLaser();
       return;
     }
-    // The build surface always sits at world Y=0 in the LPBF view (the
-    // printedGroup is translated down by `topZ` so the active layer is at 0).
-    const surfaceY = 0;
-    // Source hovers a fixed distance above the build surface, anchored over
-    // the active scan spot so the beam reads as straight-down.
-    const sourceY = Math.max(60, this.bedSize[2] * 0.45);
-    this._laser.visible = true;
-    this._laser.position.set(headMove.x, sourceY, headMove.y);
+    // The housing is stationary above the bed center; only the gimbal pivots
+    // to track the scan spot. The build surface sits at world Y=0 in LPBF mode
+    // because the printedGroup is sunk by topZ.
+    const [bx, , by] = this.bedSize;
+    const cx = bx / 2;
+    const cz = by / 2;
+    const sourceY = Math.max(90, this.bedSize[2] * 0.7);
 
+    this._laser.visible = true;
+    this._laser.position.set(cx, sourceY, cz);
+
+    const gimbal = this._laser.userData.gimbal;
     const beam = this._laser.userData.beam;
-    if (beam) {
-      // Beam stretches from the source down to the surface — local +Y points
-      // up, so a negative scaleY plus the geometry's translated origin draws
-      // it downward.
-      const length = Math.max(1, sourceY - surfaceY);
-      beam.scale.set(1, length, 1);
+    const lensLocalY = this._laser.userData.lensLocalY ?? 0;
+    if (gimbal) {
+      // Gimbal world position = housing position + gimbal local offset.
+      const gimbalWorldY = sourceY + gimbal.position.y;
+      // Direction from gimbal pivot to active spot, in world coords. The spot
+      // is at world (headMove.x, 0, headMove.y) — Y=0 because the printedGroup
+      // is sunk so the active layer always sits there.
+      const dx = headMove.x - cx;
+      const dy = 0 - gimbalWorldY;
+      const dz = headMove.y - cz;
+      const dist = Math.hypot(dx, dy, dz);
+      // Aim the gimbal so its local -Y axis points at the spot. The gimbal's
+      // parent (the laser group) has no rotation, so a world-space quaternion
+      // is also valid in the parent frame.
+      _v0.set(0, -1, 0);
+      _v1.set(dx / dist, dy / dist, dz / dist);
+      _q0.setFromUnitVectors(_v0, _v1);
+      gimbal.quaternion.copy(_q0);
+
+      if (beam) {
+        // Beam runs from the lens (at gimbal-local y=lensLocalY along the now-
+        // rotated -Y axis) to the spot. The lens lies on the gimbal-to-spot
+        // line at distance |lensLocalY|, so the remaining beam length is
+        // dist - |lensLocalY|.
+        const beamLen = Math.max(1, dist - Math.abs(lensLocalY));
+        beam.scale.set(1, beamLen, 1);
+      }
     }
+
     const flash = this._laser.userData.flash;
     if (flash) {
-      flash.position.set(0, -(sourceY - surfaceY), 0);
-      flash.intensity = 1.4;
+      // Flash is a child of the laser group (origin at housing). Convert the
+      // world spot to laser-local coords by subtracting the housing position.
+      flash.position.set(headMove.x - cx, -sourceY, headMove.y - cz);
+      flash.intensity = 1.6;
     }
   }
 
@@ -1070,18 +1324,25 @@ export class PrinterScene {
     const pos = this._sparks.geometry.attributes.position.array;
     const col = this._sparks.geometry.attributes.color.array;
     for (let i = 0; i < s.capacity; i++) {
-      if (s.life[i] <= 0) {
-        // Fully dim dead slots so the buffer's stale colors don't ghost.
-        col[i * 3 + 0] = 0;
-        col[i * 3 + 1] = 0;
-        col[i * 3 + 2] = 0;
-        continue;
-      }
+      if (s.life[i] <= 0) continue;
       s.vy[i] -= SPARK_GRAVITY * dt;
       pos[i * 3 + 0] += s.vx[i] * dt;
       pos[i * 3 + 1] += s.vy[i] * dt;
       pos[i * 3 + 2] += s.vz[i] * dt;
       s.life[i] -= dt;
+      if (s.life[i] <= 0) {
+        // Sink the slot far below the scene so PointsMaterial doesn't keep
+        // rasterizing a faint dot at the death position. We can't rely on a
+        // black vertex color — the dark scene background still tints toward
+        // visible at the material's transparent opacity.
+        pos[i * 3 + 0] = 0;
+        pos[i * 3 + 1] = PARTICLE_SINK_Y;
+        pos[i * 3 + 2] = 0;
+        col[i * 3 + 0] = 0;
+        col[i * 3 + 1] = 0;
+        col[i * 3 + 2] = 0;
+        continue;
+      }
       // Linear fade: derive current color from the recorded initial color
       // each frame. Multiplying the existing color in-place compounds across
       // frames and crashes to black far faster than `life/maxLife` implies.
@@ -1101,11 +1362,129 @@ export class PrinterScene {
     const col = this._sparks.geometry.attributes.color.array;
     pos.fill(0);
     col.fill(0);
+    for (let i = 0; i < s.capacity; i++) pos[i * 3 + 1] = PARTICLE_SINK_Y;
     s.life.fill(0);
     s.live = 0;
     s.cursor = 0;
     this._sparks.geometry.attributes.position.needsUpdate = true;
     this._sparks.geometry.attributes.color.needsUpdate = true;
+  }
+
+  _buildHeatTrail() {
+    // Heat residue points dropped at scan-segment endpoints. They sit at world
+    // Y=0 (the active build surface — printedGroup is sunk by topZ in LPBF
+    // mode) and fade white-yellow → orange → red → off so the user can see
+    // where the laser has just passed. Additive blending makes overlapping
+    // points read as a brighter melt pool rather than washed out gray.
+    const capacity = HEAT_TRAIL_CAPACITY;
+    const positions = new Float32Array(capacity * 3);
+    const colors = new Float32Array(capacity * 3);
+    for (let i = 0; i < capacity; i++) positions[i * 3 + 1] = PARTICLE_SINK_Y;
+    const geom = new THREE.BufferGeometry();
+    geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geom.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+    geom.setDrawRange(0, capacity);
+    const mat = new THREE.PointsMaterial({
+      size: 4.0,
+      vertexColors: true,
+      transparent: true,
+      opacity: 0.9,
+      depthWrite: false,
+      sizeAttenuation: true,
+      blending: THREE.AdditiveBlending,
+    });
+    const points = new THREE.Points(geom, mat);
+    points.name = 'lpbf-heat';
+    points.frustumCulled = false;
+    this._heatState = {
+      capacity,
+      cursor: 0,
+      life: new Float32Array(capacity),
+      maxLife: new Float32Array(capacity),
+      r0: new Float32Array(capacity),
+      g0: new Float32Array(capacity),
+      b0: new Float32Array(capacity),
+    };
+    return points;
+  }
+
+  _emitHeat(x, z) {
+    const s = this._heatState;
+    if (!s || !this._heatTrail) return;
+    const pos = this._heatTrail.geometry.attributes.position.array;
+    const col = this._heatTrail.geometry.attributes.color.array;
+    const i = s.cursor;
+    s.cursor = (s.cursor + 1) % s.capacity;
+    // Pin to the active build surface (world Y=0 in LPBF view). Spatial X/Z
+    // come from the segment endpoint in three.js coords.
+    pos[i * 3 + 0] = x;
+    pos[i * 3 + 1] = 0;
+    pos[i * 3 + 2] = z;
+    // Initial hot color — slight per-emit jitter on green keeps a row of
+    // adjacent melts from looking like a single solid stripe.
+    s.r0[i] = 1.0;
+    s.g0[i] = 0.85 + Math.random() * 0.12;
+    s.b0[i] = 0.45;
+    col[i * 3 + 0] = s.r0[i];
+    col[i * 3 + 1] = s.g0[i];
+    col[i * 3 + 2] = s.b0[i];
+    const life = HEAT_LIFE_MIN + Math.random() * (HEAT_LIFE_MAX - HEAT_LIFE_MIN);
+    s.life[i] = life;
+    s.maxLife[i] = life;
+    this._heatTrail.geometry.attributes.position.needsUpdate = true;
+    this._heatTrail.geometry.attributes.color.needsUpdate = true;
+  }
+
+  _tickHeat(dt) {
+    const s = this._heatState;
+    if (!s || !this._heatTrail) return;
+    const pos = this._heatTrail.geometry.attributes.position.array;
+    const col = this._heatTrail.geometry.attributes.color.array;
+    let dirty = false;
+    for (let i = 0; i < s.capacity; i++) {
+      if (s.life[i] <= 0) continue;
+      s.life[i] -= dt;
+      dirty = true;
+      if (s.life[i] <= 0) {
+        // Sink the slot off-screen and zero its color so it can't contribute
+        // a stray pixel after death.
+        pos[i * 3 + 0] = 0;
+        pos[i * 3 + 1] = PARTICLE_SINK_Y;
+        pos[i * 3 + 2] = 0;
+        col[i * 3 + 0] = 0;
+        col[i * 3 + 1] = 0;
+        col[i * 3 + 2] = 0;
+        continue;
+      }
+      // Color cooling: red channel fades slowly so the trail goes through a
+      // visible orange/red phase before dying out. Green and blue fade faster
+      // so the white-yellow start cools to red rather than gray.
+      const t = s.life[i] / s.maxLife[i];
+      const tR = Math.sqrt(t);
+      const tG = t * t;
+      const tB = t * t * t;
+      col[i * 3 + 0] = s.r0[i] * tR;
+      col[i * 3 + 1] = s.g0[i] * tG;
+      col[i * 3 + 2] = s.b0[i] * tB;
+    }
+    if (dirty) {
+      this._heatTrail.geometry.attributes.position.needsUpdate = true;
+      this._heatTrail.geometry.attributes.color.needsUpdate = true;
+    }
+  }
+
+  _clearHeat() {
+    const s = this._heatState;
+    if (!s || !this._heatTrail) return;
+    const pos = this._heatTrail.geometry.attributes.position.array;
+    const col = this._heatTrail.geometry.attributes.color.array;
+    pos.fill(0);
+    col.fill(0);
+    for (let i = 0; i < s.capacity; i++) pos[i * 3 + 1] = PARTICLE_SINK_Y;
+    s.life.fill(0);
+    s.cursor = 0;
+    this._heatTrail.geometry.attributes.position.needsUpdate = true;
+    this._heatTrail.geometry.attributes.color.needsUpdate = true;
   }
 
   _startRecoaterSweep() {
