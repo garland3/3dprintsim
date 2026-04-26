@@ -60,7 +60,11 @@ const HOT_COLOR = [1.0, 0.98, 0.75];       // just-extruded glow
 // part, not as warm filament, once the laser shuts off and the bed cools.
 // Mixed into the role+depth color by (1 - _glowFactor) so it appears
 // gradually during the cooldown and is fully present at the end.
-const LPBF_COOL_COLOR = [0.58, 0.62, 0.70];
+//
+// Picked to sit below the UnrealBloomPass threshold (0.55) on every channel
+// so the cooled print stops bleeding bloom — that was the root cause of the
+// "still glowing at the end" look users reported.
+const LPBF_COOL_COLOR = [0.34, 0.38, 0.46];
 
 // Depth ramp: each segment's base color is biased brighter as Z grows so the
 // eye reads height even on single-role prints. The shift is small (±20% per
@@ -133,13 +137,25 @@ export class PrinterScene {
     // scales the HOT_COLOR contribution in the printed-color rebuild.
     this._simEnded = false;
     this._cooldown = null; // null | { t: float in [0,1], duration: seconds }
+    // Cooldown's `t` runs 1 → 0 across two phases:
+    //   t ∈ (PHASE1_END, 1]  — "active cool": warm role palette blends to the
+    //     LPBF cool tone, the hot-tip glow fades, heat trail naturally dies.
+    //   t ∈ [0, PHASE1_END]  — "settle": print further dims toward room temp;
+    //     by t=0 nothing in the print exceeds the bloom threshold so it
+    //     stops self-illuminating.
+    // _glowFactor drives the hot-tip / warm-palette mix; _settleFactor drives
+    // the room-temp dim that runs in phase 2.
     this._glowFactor = 1.0;
+    this._settleFactor = 0.0;
     // Cooling-rate multiplier exposed to the React UI. Scales heat-trail
     // lifetimes and the end-of-sim cooldown duration so the user can dial
     // the perpetual-glow look down to taste; 2× is a noticeably faster
     // fade than the physically-truer 1×.
     this._lpbfCoolingRate = 2.0;
-    this._lpbfCooldownBaseDuration = 2.5;
+    // Bumped from 2.5s to 4.0s so heat-trail residue has time to fade
+    // naturally inside phase 1 and the settle phase has room to read as a
+    // distinct "now it's cold" beat rather than a flicker.
+    this._lpbfCooldownBaseDuration = 4.0;
     this._recoater = null;       // horizontal bar that sweeps each layer
     this._recoaterState = null;  // animation state for the recoater sweep
     this._lpbfClock = null;      // last-frame timestamp for time-step deltas
@@ -613,6 +629,7 @@ export class PrinterScene {
       this._simEnded = false;
       this._cooldown = null;
       this._glowFactor = 1.0;
+      this._settleFactor = 0.0;
       this._hideLaser();
       this._hideMeltPool();
       this._stopRecoaterSweep();
@@ -857,6 +874,10 @@ export class PrinterScene {
     const coolR = LPBF_COOL_COLOR[0];
     const coolG = LPBF_COOL_COLOR[1];
     const coolB = LPBF_COOL_COLOR[2];
+    // Phase-2 settle: drag colors further toward dim by up to 35% so the
+    // print clearly reads as "room temp" once the cooldown completes. Only
+    // fires in LPBF mode; FDM never sets _settleFactor.
+    const settleScale = 1 - 0.35 * this._settleFactor;
     for (let i = 0; i < visibleSegs; i++) {
       const s = segs[i];
       const o = i * 6;
@@ -875,7 +896,12 @@ export class PrinterScene {
       // tints. shift ∈ [-0.5, +0.5].
       const zNorm = Math.max(0, Math.min(1, (s.z - zMin) / zRange));
       const shift = zNorm - 0.5;
-      const liftAmt = shift > 0 ? shift * 2 * DEPTH_LIGHTEN : 0;
+      // Lighten on top is what most easily pushes the print above the bloom
+      // threshold once the colors are otherwise cool, so scale it by the
+      // current glow level — at full cool there's no top-side brightening,
+      // and the print sits flat below bloom. Darken on the bottom is left at
+      // full strength so the part still has shape readability when cold.
+      const liftAmt = shift > 0 ? shift * 2 * DEPTH_LIGHTEN * glow : 0;
       const sinkAmt = shift < 0 ? -shift * 2 * DEPTH_DARKEN : 0;
       let r = baseR * (1 - sinkAmt) + (1 - baseR) * liftAmt;
       let g = baseG * (1 - sinkAmt) + (1 - baseG) * liftAmt;
@@ -891,6 +917,9 @@ export class PrinterScene {
         g = g + (HOT_COLOR[1] - g) * t;
         b = b + (HOT_COLOR[2] - b) * t;
       }
+      // Final dim multiplier from the phase-2 settle. At settleScale=1 (any
+      // moment outside the settle phase) the colors pass through untouched.
+      r *= settleScale; g *= settleScale; b *= settleScale;
       col[o] = r; col[o + 1] = g; col[o + 2] = b;
       col[o + 3] = r; col[o + 4] = g; col[o + 5] = b;
     }
@@ -920,6 +949,7 @@ export class PrinterScene {
     const duration = this._lpbfCooldownBaseDuration / Math.max(0.1, this._lpbfCoolingRate);
     this._cooldown = { t: 1.0, duration };
     this._glowFactor = 1.0;
+    this._settleFactor = 0.0;
     this._hideLaser();
     this._hideMeltPool();
     this._activeHead = null;
@@ -929,6 +959,7 @@ export class PrinterScene {
     this._simEnded = false;
     this._cooldown = null;
     this._glowFactor = 1.0;
+    this._settleFactor = 0.0;
     if (restoreGlow) {
       // User scrubbed back into the run — restore the hot tip glow on the new
       // visible window so it doesn't look frozen-cool until the next setCursor.
@@ -941,7 +972,17 @@ export class PrinterScene {
     const c = this._cooldown;
     if (!c) return;
     c.t = Math.max(0, c.t - dt / c.duration);
-    this._glowFactor = c.t;
+    // Phase split. Phase 1 owns the top 70% of the timeline (t ∈ (0.3, 1]),
+    // mapping linearly into _glowFactor 1 → 0. Phase 2 owns the bottom 30%
+    // (t ∈ [0, 0.3]), mapping into _settleFactor 0 → 1 while glow stays at 0.
+    const PHASE1_END = 0.3;
+    if (c.t > PHASE1_END) {
+      this._glowFactor = (c.t - PHASE1_END) / (1 - PHASE1_END);
+      this._settleFactor = 0;
+    } else {
+      this._glowFactor = 0;
+      this._settleFactor = (PHASE1_END - c.t) / PHASE1_END;
+    }
     // Re-run only the printed-color rebuild — laser/melt/sparks are already
     // hidden and shouldn't come back during the cooldown.
     const built = this._lastVisibleSegsBuilt ?? 0;
@@ -1068,6 +1109,7 @@ export class PrinterScene {
       this._simEnded = false;
       this._cooldown = null;
       this._glowFactor = 1.0;
+      this._settleFactor = 0.0;
       this._hideLaser();
       this._hideMeltPool();
       this._stopRecoaterSweep();
