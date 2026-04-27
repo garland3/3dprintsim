@@ -156,6 +156,12 @@ export class PrinterScene {
     // naturally inside phase 1 and the settle phase has room to read as a
     // distinct "now it's cold" beat rather than a flicker.
     this._lpbfCooldownBaseDuration = 4.0;
+    // When the cooldown completes we reveal the source mesh with a metallic
+    // styling so the print stops looking like a flat gray blob — the mesh
+    // adds shading/silhouette via the existing scene lights that vertex-
+    // colored LineSegments2 can't provide. This flag tells setCursor's parts-
+    // visibility branch to stay out of partsGroup while we own its material.
+    this._lpbfCooledRevealed = false;
     this._recoater = null;       // horizontal bar that sweeps each layer
     this._recoaterState = null;  // animation state for the recoater sweep
     this._lpbfClock = null;      // last-frame timestamp for time-step deltas
@@ -567,6 +573,10 @@ export class PrinterScene {
 
   // parts: [{id, name, size, placement}], geometry dict keyed by id -> triangle list
   setParts(parts, geometryById) {
+    // Drop the cooldown reveal flag — the old stashed materials are being
+    // discarded with the cleared children, so setCursor needs to regain
+    // ownership of partsGroup visibility/styling for the new meshes.
+    this._lpbfCooledRevealed = false;
     this.partsGroup.clear();
     for (const part of parts) {
       const geomData = geometryById[part.id];
@@ -630,6 +640,7 @@ export class PrinterScene {
       this._cooldown = null;
       this._glowFactor = 1.0;
       this._settleFactor = 0.0;
+      this._hideCooledPart();
       this._hideLaser();
       this._hideMeltPool();
       this._stopRecoaterSweep();
@@ -737,9 +748,13 @@ export class PrinterScene {
     // Before any simulation progress the source mesh is the scene — always
     // show it at the upload-time opacity. Once the print starts advancing we
     // honor the `partsSimVisible` flag (defaults off) so the printed filament
-    // reads clearly instead of being smeared by the translucent mesh.
+    // reads clearly instead of being smeared by the translucent mesh. When
+    // the LPBF cooldown reveal is active we hand off ownership of the
+    // partsGroup material entirely (see _revealCooledPart).
     const simActive = visibleSegs > 0;
-    if (simActive) {
+    if (this._lpbfCooledRevealed) {
+      // Reveal owns visibility + material until _hideCooledPart undoes it.
+    } else if (simActive) {
       this.partsGroup.visible = this._partsSimVisible !== false;
       if (this.partsGroup.visible) {
         const meshOpacity = 0.12;
@@ -874,10 +889,12 @@ export class PrinterScene {
     const coolR = LPBF_COOL_COLOR[0];
     const coolG = LPBF_COOL_COLOR[1];
     const coolB = LPBF_COOL_COLOR[2];
-    // Phase-2 settle: drag colors further toward dim by up to 35% so the
-    // print clearly reads as "room temp" once the cooldown completes. Only
+    // Phase-2 settle: drag colors further toward dim so the print reads as
+    // "room temp" once the cooldown completes. 20% (down from 35%) keeps the
+    // toolpath visible against the dark scene background — the lit part-mesh
+    // reveal at cooldown end carries the rest of the readability load. Only
     // fires in LPBF mode; FDM never sets _settleFactor.
-    const settleScale = 1 - 0.35 * this._settleFactor;
+    const settleScale = 1 - 0.20 * this._settleFactor;
     for (let i = 0; i < visibleSegs; i++) {
       const s = segs[i];
       const o = i * 6;
@@ -960,9 +977,13 @@ export class PrinterScene {
     this._cooldown = null;
     this._glowFactor = 1.0;
     this._settleFactor = 0.0;
+    // User scrubbed back into the run — drop the cooled-part reveal so the
+    // part returns to its in-sim ghost styling and setCursor regains
+    // ownership of the partsGroup material.
+    this._hideCooledPart();
     if (restoreGlow) {
-      // User scrubbed back into the run — restore the hot tip glow on the new
-      // visible window so it doesn't look frozen-cool until the next setCursor.
+      // Restore the hot tip glow on the new visible window so it doesn't
+      // look frozen-cool until the next setCursor.
       const built = this._lastVisibleSegsBuilt ?? 0;
       if (built > 0) this._rebuildPrintedGeometry(built);
     }
@@ -989,9 +1010,67 @@ export class PrinterScene {
     if (built > 0) this._rebuildPrintedGeometry(built);
     if (c.t <= 0) {
       // End of cooldown: drop any heat-trail residue so the part reads as
-      // fully cooled instead of having a few stray glowing dots on top.
+      // fully cooled instead of having a few stray glowing dots on top, and
+      // reveal the source mesh so the part is no longer just flat-colored
+      // toolpath lines without lighting cues.
       this._clearHeat();
       this._cooldown = null;
+      this._revealCooledPart();
+    }
+  }
+
+  // Force the source-mesh group visible and restyle each child to a metallic
+  // gray with semi-transparent finish. The MeshStandardMaterial picks up the
+  // scene's ambient + directional lights so the part actually looks 3D — the
+  // toolpath lines alone read as a flat gray blob because LineSegments2 has
+  // no shading. Original material settings are stashed in userData so a new
+  // sim run can revert.
+  _revealCooledPart() {
+    if (!this.partsGroup || this.partsGroup.children.length === 0) return;
+    this._lpbfCooledRevealed = true;
+    this.partsGroup.visible = true;
+    for (const child of this.partsGroup.children) {
+      const mat = child.material;
+      if (!mat) continue;
+      if (!child.userData._lpbfPreCool) {
+        child.userData._lpbfPreCool = {
+          color: mat.color ? mat.color.getHex() : 0x6fb7ff,
+          opacity: mat.opacity,
+          transparent: mat.transparent,
+          depthWrite: mat.depthWrite,
+          metalness: mat.metalness ?? 0,
+          roughness: mat.roughness ?? 1,
+        };
+      }
+      if (mat.color) mat.color.setHex(0x9098a6);
+      mat.opacity = 0.78;
+      mat.transparent = true;
+      // Keep depthWrite off so the toolpath structure beneath stays visible;
+      // the mesh acts as a tinted shell that adds shading without occluding.
+      mat.depthWrite = false;
+      if (mat.metalness !== undefined) mat.metalness = 0.85;
+      if (mat.roughness !== undefined) mat.roughness = 0.35;
+      mat.needsUpdate = true;
+    }
+  }
+
+  _hideCooledPart() {
+    if (!this._lpbfCooledRevealed) return;
+    this._lpbfCooledRevealed = false;
+    if (!this.partsGroup) return;
+    for (const child of this.partsGroup.children) {
+      const orig = child.userData._lpbfPreCool;
+      if (!orig) continue;
+      const mat = child.material;
+      if (!mat) continue;
+      if (mat.color) mat.color.setHex(orig.color);
+      mat.opacity = orig.opacity;
+      mat.transparent = orig.transparent;
+      mat.depthWrite = orig.depthWrite;
+      if (mat.metalness !== undefined) mat.metalness = orig.metalness;
+      if (mat.roughness !== undefined) mat.roughness = orig.roughness;
+      delete child.userData._lpbfPreCool;
+      mat.needsUpdate = true;
     }
   }
 
@@ -1110,6 +1189,7 @@ export class PrinterScene {
       this._cooldown = null;
       this._glowFactor = 1.0;
       this._settleFactor = 0.0;
+      this._hideCooledPart();
       this._hideLaser();
       this._hideMeltPool();
       this._stopRecoaterSweep();
