@@ -426,10 +426,17 @@ def build_mcp() -> FastMCP:
 
     @tool
     def upload_stl(name: str, stl_base64: str, ctx: Context, scale: float = 1.0) -> dict:
-        """Upload an STL file as base64 bytes. Returns the new part's metadata.
+        """Upload a mesh file as base64 bytes. Returns the new part's metadata.
 
-        `scale` is a linear multiplier applied to every vertex at import — pass
-        25.4 for an STL authored in inches, 0.001 for metres, etc.
+        Supported formats (sniffed from the magic bytes; `name` extension is
+        a hint, not authoritative):
+          - `.stl` — binary or ASCII
+          - `.3mf` — Microsoft 3D Manufacturing Format (ZIP + XML)
+          - `.step` / `.stp` — ISO-10303-21 CAD (requires the optional
+            `cadquery` or `trimesh[step]` dependency on the backend)
+
+        `scale` is a linear multiplier applied to every vertex at import —
+        pass 25.4 for a model authored in inches, 0.001 for metres, etc.
         """
         part = _svc(ctx).add_part_from_base64(name, stl_base64, scale=scale)
         return _jsonable(part.to_public())

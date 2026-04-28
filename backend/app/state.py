@@ -20,7 +20,10 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+import numpy as np
+
 from .arrange import ArrangeError, ArrangeInput, Placement, arrange
+from .mesh_loader import parse_mesh
 from .slicer import SliceResult, slice_meshes
 from .stl_loader import (
     IDENTITY_ROTATION,
@@ -145,6 +148,21 @@ class Part:
             dy += self.placement.y
         return translate(base, dx, dy, dz)
 
+    def shape_fingerprint(self) -> str:
+        """Stable string identifying the part's geometry sans placement.
+
+        The frontend uses this to decide whether to refetch a part's vertex
+        buffer. Anything that changes the actual rotated/scaled geometry —
+        scale, rotation matrix, the underlying triangle data — flips the
+        fingerprint. Pure XY placement does not, so dragging a part around
+        the bed never triggers a full geometry round-trip.
+        """
+        rot_key = ",".join(f"{v:.10g}" for row in self.rotation for v in row)
+        return (
+            f"{self.id}|tris={self.mesh.triangle_count()}|"
+            f"scale={self.scale:.10g}|rot={rot_key}"
+        )
+
     def to_public(self) -> dict:
         # Coerce every numeric to a builtin float so the dict is guaranteed
         # JSON-safe. Without this, an upstream Pydantic model (e.g. a stray
@@ -159,8 +177,9 @@ class Part:
             "size": [float(v) for v in size],
             "scale": float(self.scale),
             "rotation": [[float(v) for v in row] for row in self.rotation],
-            "triangle_count": len(self.mesh.triangles),
+            "triangle_count": self.mesh.triangle_count(),
             "warnings": list(self.warnings),
+            "shape_fingerprint": self.shape_fingerprint(),
             "placement": (
                 {
                     "x": float(self.placement.x),
@@ -228,7 +247,10 @@ class PrinterService:
     def add_part_from_bytes(self, name: str, data: bytes, scale: float = 1.0) -> Part:
         if scale <= 0:
             raise ValueError(f"scale must be positive, got {scale}")
-        mesh = parse_stl(data)
+        # Multi-format dispatch — STL, 3MF, and (optionally) STEP all land
+        # here; the loader sniffs by magic bytes first, falls back to the
+        # filename extension, and raises ValueError for unsupported formats.
+        mesh = parse_mesh(data, filename=name)
         warnings = validate_mesh(mesh)
         part_id = uuid.uuid4().hex[:8]
         part = Part(
@@ -599,6 +621,65 @@ class PrinterService:
                 "min": list(placed.min_xyz),
                 "max": list(placed.max_xyz),
             }
+
+    def get_part_geometry_buffer(self, part_id: str) -> tuple[bytes, dict]:
+        """Return the placed mesh as a packed float32 byte buffer.
+
+        Vertices are emitted in **object space** with the min corner pinned
+        at (0, 0, 0) and in Three.js Y-up order. Placement (the part's bed
+        XY translation) is shipped separately in the metadata so the
+        frontend can apply it via ``mesh.position`` and translate the part
+        cheaply on the GPU when the user drags it. That means a 1M-triangle
+        mesh only has to cross the wire once per shape change — repositioning
+        becomes a single Vector3 assignment.
+
+        The legacy JSON endpoint still ships world-space (placed) vertices,
+        so callers that haven't migrated keep working.
+        """
+        with self._lock:
+            if part_id not in self.parts:
+                raise KeyError(f"unknown part {part_id}")
+            part = self.parts[part_id]
+            # Object-space mesh: scale + rotation applied, dropped to bed
+            # so min Z = 0, BUT without the placement.x/y translation. We
+            # inline that math here so we don't churn an extra Mesh copy.
+            base = part.transformed_mesh()
+            verts = base.vertices  # (N, 3, 3) float64, object frame
+            n_tris = int(verts.shape[0])
+            if n_tris == 0:
+                buffer = b""
+                obj_min = (0.0, 0.0, 0.0)
+                obj_max = (0.0, 0.0, 0.0)
+            else:
+                mn = base.min_xyz
+                # Translate so min corner is at (0, 0, 0); equivalent to
+                # placed_mesh() with placement.x = placement.y = 0.
+                shifted = verts - np.array([mn[0], mn[1], mn[2]], dtype=np.float64)
+                flat = shifted.reshape(-1, 3)
+                # Bed (x, y, z) -> Three.js (x, z, y)
+                yup = np.empty_like(flat, dtype=np.float32)
+                yup[:, 0] = flat[:, 0]
+                yup[:, 1] = flat[:, 2]
+                yup[:, 2] = flat[:, 1]
+                buffer = np.ascontiguousarray(yup).tobytes()
+                obj_min = (0.0, 0.0, 0.0)
+                obj_max = (
+                    base.max_xyz[0] - mn[0],
+                    base.max_xyz[1] - mn[1],
+                    base.max_xyz[2] - mn[2],
+                )
+            placement = part.placement
+            meta = {
+                "id": part_id,
+                "triangle_count": n_tris,
+                "min": list(obj_min),
+                "max": list(obj_max),
+                "placement_x": float(placement.x) if placement is not None else 0.0,
+                "placement_y": float(placement.y) if placement is not None else 0.0,
+                "has_placement": placement is not None,
+                "shape_fingerprint": part.shape_fingerprint(),
+            }
+            return buffer, meta
 
     # --- internal ---
 

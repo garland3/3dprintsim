@@ -117,6 +117,37 @@ export const api = {
   },
   listParts: () => getJSON('/api/parts'),
   partGeometry: (id) => getJSON(`/api/parts/${id}/geometry`),
+  // Fetch the placed mesh as raw float32 bytes already in Three.js Y-up
+  // order. Returns `{ positions: Float32Array, triangleCount, min, max,
+  // shapeFingerprint }`. Backend ships ~36 MB for 1M triangles instead of
+  // ~150 MB of JSON, so big-file uploads stay responsive in the UI.
+  partGeometryBin: async (id) => {
+    const resp = await fetch(`/api/parts/${id}/geometry.bin`, {
+      ...GET,
+      headers: SESSION_HEADERS,
+    });
+    if (!resp.ok) {
+      const text = await resp.text();
+      throw new Error(`${resp.status} ${resp.statusText}: ${text}`);
+    }
+    const buf = await resp.arrayBuffer();
+    const triangleCount = Number(resp.headers.get('X-Triangle-Count') || 0);
+    const parseVec3 = (raw) => (raw ? raw.split(',').map(Number) : null);
+    const rawPlace = resp.headers.get('X-Placement');
+    const placement = rawPlace
+      ? rawPlace.split(',').map(Number)
+      : null;
+    return {
+      positions: new Float32Array(buf),
+      triangleCount,
+      min: parseVec3(resp.headers.get('X-Aabb-Min')),
+      max: parseVec3(resp.headers.get('X-Aabb-Max')),
+      shapeFingerprint: resp.headers.get('X-Shape-Fingerprint') || '',
+      // Object-space buffer: caller must translate by `placement` (bed XY)
+      // when rendering. Null when the part is unplaced.
+      placement,
+    };
+  },
   removePart: (id) =>
     fetch(`/api/parts/${id}`, { method: 'DELETE', headers: SESSION_HEADERS }).then(json),
   clearParts: () =>

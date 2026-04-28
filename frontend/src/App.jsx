@@ -492,20 +492,59 @@ export default function App() {
 
   useEffect(() => { refreshState(); }, [refreshState]);
 
+  // Cache of the last fingerprint we fetched geometry for, keyed by part id.
+  // Lets the effect below skip the (potentially huge) /geometry.bin round
+  // trip when only a part's placement changed — the scene's setParts is
+  // already diff-based, so passing through with no geomData causes it to
+  // just translate the cached mesh. Cleared when the part is removed.
+  const partGeomFingerprintRef = useRef(new Map());
+
   // Refresh part geometries whenever the parts list changes.
   useEffect(() => {
     let cancelled = false;
     (async () => {
       if (!sceneRef.current) return;
+      const fpCache = partGeomFingerprintRef.current;
       if (parts.length === 0) {
         sceneRef.current.setParts([], {});
+        fpCache.clear();
         return;
       }
-      const geomEntries = await Promise.all(
-        parts.map(async (p) => [p.id, await api.partGeometry(p.id)]),
-      );
-      if (cancelled) return;
-      const geomById = Object.fromEntries(geomEntries);
+      // Drop cache entries for parts that no longer exist.
+      const liveIds = new Set(parts.map((p) => p.id));
+      for (const id of Array.from(fpCache.keys())) {
+        if (!liveIds.has(id)) fpCache.delete(id);
+      }
+      // Only fetch geometry for parts whose shape fingerprint changed; for
+      // everything else the scene reuses its cached BufferGeometry and just
+      // notes the new placement. A 1M-triangle part can be dragged around
+      // the bed without a single byte of geometry crossing the wire.
+      const toFetch = parts.filter((p) => {
+        const fp = p.shape_fingerprint || '';
+        return fpCache.get(p.id) !== fp;
+      });
+      let geomById = {};
+      if (toFetch.length > 0) {
+        const fetched = await Promise.all(
+          toFetch.map(async (p) => {
+            // Prefer the binary endpoint; fall back to JSON if a proxy
+            // strips the response or an older backend version is in front
+            // of us.
+            try {
+              const bin = await api.partGeometryBin(p.id);
+              return [p.id, bin, p.shape_fingerprint || ''];
+            } catch (_) {
+              const json = await api.partGeometry(p.id);
+              return [p.id, json, p.shape_fingerprint || ''];
+            }
+          }),
+        );
+        if (cancelled) return;
+        for (const [id, geom, fp] of fetched) {
+          geomById[id] = geom;
+          fpCache.set(id, fp);
+        }
+      }
       sceneRef.current.setParts(parts, geomById);
     })();
     return () => { cancelled = true; };
@@ -869,11 +908,11 @@ export default function App() {
             {uploadBusy ? (
               <><Spinner /> <span>Uploading…</span></>
             ) : (
-              <>Drop .stl here or click to browse ({uploadUnit})</>
+              <>Drop .stl / .3mf / .step here or click to browse ({uploadUnit})</>
             )}
             <input
               type="file"
-              accept=".stl"
+              accept=".stl,.3mf,.step,.stp"
               style={{ display: 'none' }}
               disabled={uploadBusy}
               onChange={(e) => {

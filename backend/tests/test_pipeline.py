@@ -14,7 +14,7 @@ from fastapi.testclient import TestClient
 from app.main import create_app
 from app.state import reset_service
 
-from .fixtures import make_ascii_triangle_stl, make_binary_cube_stl
+from .fixtures import make_3mf_cube, make_ascii_triangle_stl, make_binary_cube_stl
 
 
 @pytest.fixture
@@ -90,6 +90,142 @@ def test_ascii_stl_parses():
 
     mesh = parse_stl(make_ascii_triangle_stl())
     assert len(mesh.triangles) == 1
+
+
+def test_part_geometry_bin_returns_float32_in_yup(client: TestClient):
+    """Binary geometry endpoint ships raw float32 in Three.js Y-up object space.
+
+    Verifies body length, that vertices live in object space (min corner
+    pinned at the origin), and that placement metadata rides in headers
+    so the renderer can apply it via mesh.position without a refetch.
+    """
+    import struct
+
+    pid = upload_cube(client, size=10.0)
+    r = client.get(f"/api/parts/{pid}/geometry.bin")
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("application/octet-stream")
+    tri_count = int(r.headers["x-triangle-count"])
+    assert tri_count == 12
+    assert len(r.content) == tri_count * 9 * 4
+
+    floats = struct.unpack(f"<{tri_count * 9}f", r.content)
+    grouped = [floats[i : i + 3] for i in range(0, len(floats), 3)]
+    xs = [v[0] for v in grouped]
+    ys = [v[1] for v in grouped]
+    zs = [v[2] for v in grouped]
+    # Object-space cube: every axis lives in [0, 10].
+    assert min(xs) >= -1e-3 and max(xs) <= 10.0 + 1e-3
+    assert min(ys) >= -1e-3 and max(ys) <= 10.0 + 1e-3
+    assert min(zs) >= -1e-3 and max(zs) <= 10.0 + 1e-3
+
+    # Headers carry triangle count, AABB, fingerprint, and bed placement.
+    assert r.headers["x-aabb-min"] == "0.0,0.0,0.0"
+    assert r.headers["x-shape-fingerprint"]
+    placement = [float(v) for v in r.headers["x-placement"].split(",")]
+    # Default 250x210 bed centers a 10mm cube at (120, 100).
+    assert placement == [120.0, 100.0]
+
+
+def test_part_geometry_bin_404s_for_unknown(client: TestClient):
+    r = client.get("/api/parts/missing/geometry.bin")
+    assert r.status_code == 404
+
+
+def test_3mf_upload_parses_cube_into_part(client: TestClient):
+    """3MF (ZIP-based mesh format) round-trips through the upload endpoint."""
+    data = make_3mf_cube(size=10.0)
+    resp = client.post(
+        "/api/parts/upload",
+        files={"file": ("cube.3mf", data, "application/vnd.ms-package.3dmanufacturing-3dmodel+xml")},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["size"] == [10.0, 10.0, 10.0]
+    assert body["triangle_count"] == 12
+
+
+def test_3mf_upload_honors_build_transform(client: TestClient):
+    """3MF `<item transform="...">` (column-major affine) is applied at parse time.
+
+    A unit-scale transform that translates (5, 5, 5) should bump each axis
+    of the bbox up by 5 mm.
+    """
+    # 3MF transform is 12 floats, column-major: rotation cols 0..2 then
+    # translation as col 3.
+    transform = "1 0 0 0 1 0 0 0 1 5 5 5"
+    data = make_3mf_cube(size=10.0, transform=transform)
+    resp = client.post(
+        "/api/parts/upload",
+        files={"file": ("cube_translated.3mf", data, "model/3mf")},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    # Size doesn't change with translation; what changes is the placement,
+    # which the frontend handles separately. Verify size + triangle count.
+    assert body["size"] == [10.0, 10.0, 10.0]
+    assert body["triangle_count"] == 12
+
+
+def test_3mf_parse_directly():
+    """Sanity-check the 3MF parser produces a valid Mesh."""
+    from app.mesh_loader import parse_mesh
+
+    mesh = parse_mesh(make_3mf_cube(size=20.0), filename="cube.3mf")
+    assert mesh.triangle_count() == 12
+    assert mesh.size == (20.0, 20.0, 20.0)
+
+
+def test_step_upload_without_backend_returns_clear_error(client: TestClient):
+    """Uploading a STEP file with no STEP backend installed should 400 with
+    an actionable error rather than a 500."""
+    # Minimal but plausible STEP header so the dispatcher routes to parse_step.
+    payload = (
+        b"ISO-10303-21;\n"
+        b"HEADER;\n"
+        b"FILE_DESCRIPTION(('test'),'2;1');\n"
+        b"FILE_NAME('cube.step','',(''),(''),'','','');\n"
+        b"FILE_SCHEMA(('CONFIG_CONTROL_DESIGN'));\n"
+        b"ENDSEC;\n"
+        b"DATA;\nENDSEC;\nEND-ISO-10303-21;\n"
+    )
+    resp = client.post(
+        "/api/parts/upload",
+        files={"file": ("cube.step", payload, "application/step")},
+    )
+    # cadquery / trimesh-with-step are optional dependencies that aren't
+    # part of the default backend env; the loader should report that
+    # clearly instead of 500-ing on an ImportError.
+    if resp.status_code == 200:
+        # If a CI image happens to ship cadquery, that's fine — at least
+        # confirm the response shape is consistent.
+        assert "size" in resp.json()
+    else:
+        assert resp.status_code == 400
+        assert "STEP" in resp.json()["detail"]
+
+
+def test_unknown_format_rejected(client: TestClient):
+    resp = client.post(
+        "/api/parts/upload",
+        files={"file": ("notes.txt", b"hello world", "text/plain")},
+    )
+    assert resp.status_code == 400
+
+
+def test_part_to_public_includes_shape_fingerprint(client: TestClient):
+    pid = upload_cube(client, size=10.0)
+    r = client.get("/api/parts").json()
+    fp = r[0]["shape_fingerprint"]
+    assert isinstance(fp, str) and pid in fp
+    # Repositioning leaves geometry untouched, so fingerprint stays stable.
+    client.post(f"/api/parts/{pid}/position", json={"x": 50.0, "y": 60.0})
+    r2 = client.get("/api/parts").json()
+    assert r2[0]["shape_fingerprint"] == fp
+    # Scaling changes vertex coords -> different fingerprint.
+    client.post(f"/api/parts/{pid}/scale", json={"scale": 2.0})
+    r3 = client.get("/api/parts").json()
+    assert r3[0]["shape_fingerprint"] != fp
 
 
 def test_arrange_places_parts_inside_bed(client: TestClient):

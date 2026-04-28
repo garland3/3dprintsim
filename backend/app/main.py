@@ -315,7 +315,18 @@ def create_app() -> FastAPI:
         # has no effect on the request-side allowlist, which `*` already
         # covers, but documents that this header is part of the API contract.
         allow_headers=["*"],
-        expose_headers=["X-Session-Id"],
+        # Custom headers must be listed in `expose_headers` for the browser
+        # to surface them via `fetch().headers.get(...)`. The geometry.bin
+        # endpoint relies on the X-* headers to ship triangle count + AABB
+        # without forcing a separate metadata round-trip.
+        expose_headers=[
+            "X-Session-Id",
+            "X-Triangle-Count",
+            "X-Aabb-Min",
+            "X-Aabb-Max",
+            "X-Shape-Fingerprint",
+            "X-Placement",
+        ],
     )
     app.add_middleware(
         IframeEmbedMiddleware,
@@ -373,10 +384,15 @@ def create_app() -> FastAPI:
         scale: float = Form(1.0),
         svc: PrinterService = Depends(session_service),
     ) -> dict:
-        """Upload an STL.
+        """Upload a mesh file (.stl, .3mf, .step/.stp).
 
         Pass `scale` as a form field to convert non-mm units at import time —
-        e.g. `scale=25.4` for an STL authored in inches.
+        e.g. `scale=25.4` for a model authored in inches.
+
+        STEP support requires the optional `cadquery` (or
+        `trimesh[step]`) dependency in the backend environment; uploading
+        a STEP file when neither is installed surfaces as a 400 with an
+        install hint rather than a 500.
         """
         data = await file.read()
         try:
@@ -444,6 +460,44 @@ def create_app() -> FastAPI:
             return svc.get_part_geometry(part_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/api/parts/{part_id}/geometry.bin")
+    def part_geometry_bin(
+        part_id: str,
+        svc: PrinterService = Depends(session_service),
+    ) -> Response:
+        """Same geometry as `/api/parts/{part_id}/geometry`, packed as raw
+        float32 bytes in Three.js Y-up order so big meshes don't have to
+        round-trip through JSON.
+
+        Body layout: `triangle_count * 9` little-endian float32 values
+        (3 vertices × xyz per triangle). Bounding box and triangle count
+        ride in response headers so the frontend doesn't need a separate
+        metadata round-trip.
+        """
+        try:
+            buffer, meta = svc.get_part_geometry_buffer(part_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        mn = meta["min"]
+        mx = meta["max"]
+        headers = {
+            "X-Triangle-Count": str(meta["triangle_count"]),
+            "X-Aabb-Min": f"{mn[0]},{mn[1]},{mn[2]}",
+            "X-Aabb-Max": f"{mx[0]},{mx[1]},{mx[2]}",
+            "X-Shape-Fingerprint": meta["shape_fingerprint"],
+            "X-Placement": (
+                f"{meta['placement_x']},{meta['placement_y']}"
+                if meta["has_placement"]
+                else ""
+            ),
+            "Cache-Control": "no-store",
+        }
+        return Response(
+            content=buffer,
+            media_type="application/octet-stream",
+            headers=headers,
+        )
 
     @app.delete("/api/parts/{part_id}")
     def delete_part(
