@@ -492,20 +492,77 @@ export default function App() {
 
   useEffect(() => { refreshState(); }, [refreshState]);
 
+  // Cache of the last geometry we fetched per part. Each entry tracks the
+  // shape fingerprint AND which transport actually delivered it, because
+  // the two transports have different placement semantics:
+  //   - binary: object-space vertices, placement applied via mesh.position
+  //     -> placement-only changes are free, no refetch needed.
+  //   - JSON (legacy): world-space vertices with placement BAKED IN
+  //     -> every placement change must refetch or the mesh drifts from
+  //     the server's clamped/canonical position.
+  // The `placementKey` field is consulted only on the JSON path.
+  const partGeomFingerprintRef = useRef(new Map());
+
   // Refresh part geometries whenever the parts list changes.
   useEffect(() => {
     let cancelled = false;
     (async () => {
       if (!sceneRef.current) return;
+      const fpCache = partGeomFingerprintRef.current;
       if (parts.length === 0) {
         sceneRef.current.setParts([], {});
+        fpCache.clear();
         return;
       }
-      const geomEntries = await Promise.all(
-        parts.map(async (p) => [p.id, await api.partGeometry(p.id)]),
-      );
-      if (cancelled) return;
-      const geomById = Object.fromEntries(geomEntries);
+      // Drop cache entries for parts that no longer exist.
+      const liveIds = new Set(parts.map((p) => p.id));
+      for (const id of Array.from(fpCache.keys())) {
+        if (!liveIds.has(id)) fpCache.delete(id);
+      }
+      const placementKey = (placement) => {
+        if (!placement) return 'none';
+        return `${placement.x},${placement.y},${placement.rotation_deg ?? 0}`;
+      };
+      // Only fetch geometry for parts whose shape fingerprint changed — and,
+      // for entries last delivered via the JSON fallback, also when the
+      // placement shifted (since that path bakes placement into vertices).
+      const toFetch = parts.filter((p) => {
+        const cached = fpCache.get(p.id);
+        if (!cached) return true;
+        if (cached.fingerprint !== (p.shape_fingerprint || '')) return true;
+        if (cached.kind === 'json'
+            && cached.placementKey !== placementKey(p.placement)) {
+          return true;
+        }
+        return false;
+      });
+      let geomById = {};
+      if (toFetch.length > 0) {
+        const fetched = await Promise.all(
+          toFetch.map(async (p) => {
+            // Prefer the binary endpoint; fall back to JSON if a proxy
+            // strips the response or an older backend version is in front
+            // of us. The cache entry records which path won so the next
+            // pass can decide whether placement-only changes need a refetch.
+            try {
+              const bin = await api.partGeometryBin(p.id);
+              return [p.id, bin, 'binary', p];
+            } catch (_) {
+              const json = await api.partGeometry(p.id);
+              return [p.id, json, 'json', p];
+            }
+          }),
+        );
+        if (cancelled) return;
+        for (const [id, geom, kind, p] of fetched) {
+          geomById[id] = geom;
+          fpCache.set(id, {
+            fingerprint: p.shape_fingerprint || '',
+            kind,
+            placementKey: placementKey(p.placement),
+          });
+        }
+      }
       sceneRef.current.setParts(parts, geomById);
     })();
     return () => { cancelled = true; };
@@ -869,11 +926,11 @@ export default function App() {
             {uploadBusy ? (
               <><Spinner /> <span>Uploading…</span></>
             ) : (
-              <>Drop .stl here or click to browse ({uploadUnit})</>
+              <>Drop .stl / .3mf / .step here or click to browse ({uploadUnit})</>
             )}
             <input
               type="file"
-              accept=".stl"
+              accept=".stl,.3mf,.step,.stp"
               style={{ display: 'none' }}
               disabled={uploadBusy}
               onChange={(e) => {

@@ -24,6 +24,8 @@ import math
 from dataclasses import dataclass, field
 from typing import Literal
 
+import numpy as np
+
 from .geometry import (
     offset_polygon,
     pick_seam_index,
@@ -276,31 +278,53 @@ def _compute_layer_zs(
         return zs
 
     # Adaptive: pre-bucket triangles by z-range so picking the local max-slope
-    # doesn't re-scan the whole mesh per layer.
-    all_tris: list[tuple[float, float, float]] = []  # (tmin, tmax, slope_cost)
+    # doesn't re-scan the whole mesh per layer. Computed once in numpy so
+    # multi-million-triangle meshes don't pay Python loop overhead.
+    chunks: list[np.ndarray] = []
     for m in meshes:
-        for t in m.triangles:
-            tmin = min(t.v0[2], t.v1[2], t.v2[2])
-            tmax = max(t.v0[2], t.v1[2], t.v2[2])
-            nz_abs = _tri_normal_z(t)
-            # slope cost peaks at 45° (nz_abs ≈ 0.707) — those are the faces
-            # where layer banding is visible. Vertical walls (nz_abs≈0) and
-            # horizontal tops (nz_abs≈1) don't benefit from thinner layers.
-            slope_cost = 4.0 * nz_abs * (1.0 - nz_abs)
-            all_tris.append((tmin, tmax, slope_cost))
+        v = m.vertices
+        if v.shape[0] == 0:
+            continue
+        tmin = v[:, :, 2].min(axis=1)
+        tmax = v[:, :, 2].max(axis=1)
+        a = v[:, 0, :]
+        b = v[:, 1, :]
+        c = v[:, 2, :]
+        u = b - a
+        w = c - a
+        nx = u[:, 1] * w[:, 2] - u[:, 2] * w[:, 1]
+        ny = u[:, 2] * w[:, 0] - u[:, 0] * w[:, 2]
+        nz = u[:, 0] * w[:, 1] - u[:, 1] * w[:, 0]
+        length = np.sqrt(nx * nx + ny * ny + nz * nz)
+        # slope cost peaks at 45° (nz_abs ≈ 0.707) — those are the faces
+        # where layer banding is visible. Vertical walls (nz_abs≈0) and
+        # horizontal tops (nz_abs≈1) don't benefit from thinner layers.
+        with np.errstate(divide="ignore", invalid="ignore"):
+            nz_abs = np.where(length > EPS, np.abs(nz) / length, 0.0)
+        slope_cost = 4.0 * nz_abs * (1.0 - nz_abs)
+        chunks.append(np.stack([tmin, tmax, slope_cost], axis=1))
+    if chunks:
+        all_tris_arr = np.concatenate(chunks, axis=0)
+        all_tmin = all_tris_arr[:, 0]
+        all_tmax = all_tris_arr[:, 1]
+        all_cost = all_tris_arr[:, 2]
+    else:
+        all_tmin = np.zeros(0)
+        all_tmax = np.zeros(0)
+        all_cost = np.zeros(0)
 
     next_center = z_top + h_max / 2.0
     while next_center < max_z + h_max / 2.0 and len(zs) < 10000:
         window_top = next_center + h_max / 2.0
         window_bot = next_center - h_max / 2.0
-        local = 0.0
-        for tmin, tmax, cost in all_tris:
-            if tmax < window_bot or tmin > window_top:
-                continue
-            if cost > local:
-                local = cost
-                if local > 0.99:
-                    break
+        if all_cost.size == 0:
+            local = 0.0
+        else:
+            mask = (all_tmax >= window_bot) & (all_tmin <= window_top)
+            if np.any(mask):
+                local = float(all_cost[mask].max())
+            else:
+                local = 0.0
         # Blend h_max → h_min as slope cost rises.
         dz = h_max - (h_max - h_min) * local
         dz = max(h_min, min(h_max, dz))
@@ -426,19 +450,44 @@ def slice_meshes(
     # Pre-pass 1: slice every mesh at every layer and rasterize the resulting
     # polygons. We need the full mask stack to decide top/bottom/overhang and
     # to route supports.
+    #
+    # The naive "for tri in mesh.triangles" loop here was the dominant cost
+    # for large meshes — a 1M-tri part with 200 layers ran 200M Python
+    # iterations of ``_segment_at_z``. For each mesh we now precompute every
+    # triangle's z-extent in numpy and, for each layer, scan only the
+    # triangles whose extent actually overlaps that layer plane. Tall, thin
+    # meshes drop two orders of magnitude in slice time.
     mesh_layer_polys: list[list[list[list[tuple[float, float]]]]] = []
     mesh_layer_masks: list[list[frozenset]] = []
     for mesh in meshes:
         poly_by_layer: list[list[list[tuple[float, float]]]] = []
         masks: list[frozenset] = []
+        verts = mesh.vertices  # (N, 3, 3) float64
+        if verts.shape[0] > 0:
+            tri_zmin = verts[:, :, 2].min(axis=1)
+            tri_zmax = verts[:, :, 2].max(axis=1)
+            triangles_cache = mesh.triangles  # build the Triangle cache once
+        else:
+            tri_zmin = np.zeros(0)
+            tri_zmax = np.zeros(0)
+            triangles_cache = []
+        mesh_zmin = mesh.min_xyz[2]
+        mesh_zmax = mesh.max_xyz[2]
         for z_target in zs:
-            if z_target < mesh.min_xyz[2] - EPS or z_target > mesh.max_xyz[2] + EPS:
+            if z_target < mesh_zmin - EPS or z_target > mesh_zmax + EPS:
                 poly_by_layer.append([])
                 masks.append(frozenset())
                 continue
+            # Bucket: only triangles whose z-extent brackets z_target can
+            # cross the layer plane. ``np.where`` returns a sorted index
+            # array; iterating that is materially faster than retesting every
+            # triangle in Python.
+            idxs = np.where(
+                (tri_zmin <= z_target + EPS) & (tri_zmax >= z_target - EPS)
+            )[0]
             segs: list[tuple[tuple[float, float], tuple[float, float]]] = []
-            for tri in mesh.triangles:
-                s = _segment_at_z(tri, z_target)
+            for i in idxs:
+                s = _segment_at_z(triangles_cache[int(i)], z_target)
                 if s is not None:
                     segs.append(s)
             polylines = _chain_segments(segs)

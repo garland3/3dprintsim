@@ -97,3 +97,65 @@ def make_ascii_triangle_stl() -> bytes:
         b"  endfacet\n"
         b"endsolid tri\n"
     )
+
+
+def make_3mf_cube(size: float = 10.0, *, transform: str | None = None) -> bytes:
+    """Return a tiny 3MF (ZIP) carrying a single-cube model.
+
+    Mirrors `make_binary_cube_stl` so the same upload-pipeline tests can
+    exercise both formats. `transform` lets callers pass a build-item
+    transformation matrix (12-float, column-major) to verify the loader
+    applies build transforms correctly.
+    """
+    import io
+    import zipfile
+
+    s = size
+    verts = [
+        (0, 0, 0), (s, 0, 0), (s, s, 0), (0, s, 0),
+        (0, 0, s), (s, 0, s), (s, s, s), (0, s, s),
+    ]
+    tris = [
+        (0, 2, 1), (0, 3, 2),
+        (4, 5, 6), (4, 6, 7),
+        (0, 1, 5), (0, 5, 4),
+        (3, 7, 6), (3, 6, 2),
+        (1, 2, 6), (1, 6, 5),
+        (0, 4, 7), (0, 7, 3),
+    ]
+
+    vert_xml = "".join(
+        f'<vertex x="{x}" y="{y}" z="{z}"/>' for (x, y, z) in verts
+    )
+    tri_xml = "".join(
+        f'<triangle v1="{a}" v2="{b}" v3="{c}"/>' for (a, b, c) in tris
+    )
+    item_attr = f' transform="{transform}"' if transform else ""
+    model_xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<model unit="millimeter" '
+        'xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02">'
+        "<resources>"
+        '<object id="1" type="model"><mesh>'
+        f"<vertices>{vert_xml}</vertices>"
+        f"<triangles>{tri_xml}</triangles>"
+        "</mesh></object>"
+        "</resources>"
+        f'<build><item objectid="1"{item_attr}/></build>'
+        "</model>"
+    )
+
+    bio = io.BytesIO()
+    with zipfile.ZipFile(bio, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(
+            "[Content_Types].xml",
+            (
+                '<?xml version="1.0"?>'
+                '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+                '<Default Extension="model" '
+                'ContentType="application/vnd.ms-package.3dmanufacturing-3dmodel+xml"/>'
+                "</Types>"
+            ),
+        )
+        zf.writestr("3D/3dmodel.model", model_xml)
+    return bio.getvalue()

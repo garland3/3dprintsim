@@ -200,6 +200,15 @@ export class PrinterScene {
     }
     this._disposeGroup(this.toolpathGroup);
     this._disposeGroup(this.printedGroup);
+    // Cached part meshes own their own materials/geometries since setParts
+    // is diff-based; release them here on hard shutdown.
+    if (this._partMeshes) {
+      for (const mesh of this._partMeshes.values()) {
+        if (mesh.geometry) mesh.geometry.dispose();
+        if (mesh.material) mesh.material.dispose();
+      }
+      this._partMeshes.clear();
+    }
     if (this.composer) this.composer.dispose();
     this.renderer.dispose();
   }
@@ -316,18 +325,23 @@ export class PrinterScene {
           const mesh = picked.mesh;
           if (!mesh.geometry.boundingBox) mesh.geometry.computeBoundingBox();
           const bb = mesh.geometry.boundingBox;
+          // Two coordinate flavors live behind userData.objectSpace:
+          //   - binary path: bb is in object space (min corner at origin),
+          //     mesh.position holds the bed XY placement.
+          //   - legacy path: bb is in world (bed) space, mesh.position is
+          //     (0,0,0) at rest and only used as a transient drag offset.
           this._partDrag = {
             mesh,
             partId: picked.partId,
-            // Triangles are already in world/bed coords; mesh.position is
-            // (0,0,0) at rest. On release we compute the new min-corner as
-            // bb.min + current offset and hand it up for persistence.
+            objectSpace: !!mesh.userData.objectSpace,
             baseMinX: bb.min.x,
             baseMinZ: bb.min.z,
             width: bb.max.x - bb.min.x,
             depth: bb.max.z - bb.min.z,
             anchorX: anchor.x,
             anchorZ: anchor.z,
+            startPosX: mesh.position.x,
+            startPosZ: mesh.position.z,
           };
           dragging = false;
           panning = false;
@@ -348,12 +362,16 @@ export class PrinterScene {
       if (this._partDrag) {
         const d = this._partDrag;
         this._partDrag = null;
-        // Translate the mesh's current offset into a new min-corner on the
-        // bed (baseMin + currentOffset) and hand it up to the app layer for
-        // persistence. We don't wait for the round-trip — the refresh after
-        // the API call rebuilds setParts with canonical geometry.
-        const newX = d.baseMinX + d.mesh.position.x;
-        const newY = d.baseMinZ + d.mesh.position.z;
+        // Compute the new bed min-corner. In object-space mode mesh.position
+        // already IS the bed XY placement (baseMin = 0 by construction). In
+        // legacy world-space mode the mesh starts at (0,0,0) and the drag
+        // offset is summed with the baked-in min corner.
+        const newX = d.objectSpace
+          ? d.mesh.position.x
+          : d.baseMinX + d.mesh.position.x;
+        const newY = d.objectSpace
+          ? d.mesh.position.z
+          : d.baseMinZ + d.mesh.position.z;
         if (typeof this.onPartDragEnd === 'function') {
           try {
             await this.onPartDragEnd(d.partId, newX, newY);
@@ -371,16 +389,26 @@ export class PrinterScene {
         const p = pointerToBed(e);
         if (!p) return;
         const d = this._partDrag;
-        // Keep the grabbed point on the bed under the cursor: mesh offset
-        // shifts by (pointer - anchor) in bed-space coordinates.
-        let dx = p.x - d.anchorX;
-        let dz = p.z - d.anchorZ;
-        // Clamp so the visual preview matches the server-side clamp. bed X
-        // maps to Three.js X; bed Y maps to Three.js Z.
+        const dx = p.x - d.anchorX;
+        const dz = p.z - d.anchorZ;
         const [bx, , by] = this.bedSize;
-        dx = Math.max(-d.baseMinX, Math.min(bx - d.width - d.baseMinX, dx));
-        dz = Math.max(-d.baseMinZ, Math.min(by - d.depth - d.baseMinZ, dz));
-        d.mesh.position.set(dx, 0, dz);
+        if (d.objectSpace) {
+          // mesh.position carries the absolute bed placement; shift it by
+          // the pointer movement and clamp to the bed extents.
+          let nx = d.startPosX + dx;
+          let nz = d.startPosZ + dz;
+          nx = Math.max(0, Math.min(bx - d.width, nx));
+          nz = Math.max(0, Math.min(by - d.depth, nz));
+          d.mesh.position.set(nx, 0, nz);
+        } else {
+          // Legacy: mesh.position is a delta on top of baked-in vertex
+          // coords. Clamp so the resulting min-corner stays on the bed.
+          let cdx = dx;
+          let cdz = dz;
+          cdx = Math.max(-d.baseMinX, Math.min(bx - d.width - d.baseMinX, cdx));
+          cdz = Math.max(-d.baseMinZ, Math.min(by - d.depth - d.baseMinZ, cdz));
+          d.mesh.position.set(cdx, 0, cdz);
+        }
         return;
       }
       if (!dragging && !panning) return;
@@ -571,41 +599,125 @@ export class PrinterScene {
     return sprite;
   }
 
-  // parts: [{id, name, size, placement}], geometry dict keyed by id -> triangle list
+  // parts: [{id, name, size, placement, shape_fingerprint}], geometry dict
+  // keyed by part id -> binary `{ positions: Float32Array, placement, ... }`
+  // (object-space, caller-translated) or legacy `{ triangles: [[[x,y,z],...]] }`
+  // (world-space, placement baked in).
+  //
+  // Diff-based: meshes whose `shape_fingerprint` matches the previous render
+  // are reused; only new or shape-changed parts cost a full BufferGeometry
+  // rebuild. With the binary endpoint the geometry is stored in object
+  // space, so placement updates collapse into a single `mesh.position` set
+  // — dragging a million-triangle part across the bed never re-uploads the
+  // vertex buffer.
   setParts(parts, geometryById) {
-    // Drop the cooldown reveal flag — the old stashed materials are being
-    // discarded with the cleared children, so setCursor needs to regain
-    // ownership of partsGroup visibility/styling for the new meshes.
     this._lpbfCooledRevealed = false;
-    this.partsGroup.clear();
+    const incomingIds = new Set(parts.map((p) => p.id));
+    const existing = this._partMeshes || new Map();
+    // Drop meshes for parts that are no longer present.
+    for (const [id, mesh] of existing) {
+      if (!incomingIds.has(id)) {
+        this.partsGroup.remove(mesh);
+        if (mesh.geometry) mesh.geometry.dispose();
+        if (mesh.material) mesh.material.dispose();
+        existing.delete(id);
+      }
+    }
     for (const part of parts) {
       const geomData = geometryById[part.id];
-      if (!geomData) continue;
-      const positions = [];
-      for (const tri of geomData.triangles) {
-        for (const v of tri) {
-          // Backend uses (x, y, z) where z is up. Three.js default is y up,
-          // so map (x, z, y) when we push into the buffer.
-          positions.push(v[0], v[2], v[1]);
+      const fingerprint = part.shape_fingerprint || '';
+      const cached = existing.get(part.id);
+      const reuse = cached && cached.userData.shapeFingerprint === fingerprint;
+      if (reuse) {
+        // Shape unchanged — only placement may have shifted; for the binary
+        // (object-space) path that's just a Vector3 update.
+        if (cached.userData.objectSpace) {
+          this._applyPlacement(cached, part.placement);
+        } else if (geomData) {
+          // Legacy world-space path: caller fetched a fresh geometry, so
+          // rebuild below to pick up the new placement.
+          // (Fall through.)
+        } else {
+          // Legacy world-space path with no fresh geometry: no-op (the
+          // placement is already baked into the geometry the caller
+          // chose not to refetch). Keep the cached mesh as-is.
+          continue;
         }
+        if (cached.userData.objectSpace) continue;
       }
+      if (!geomData) {
+        if (cached) {
+          this.partsGroup.remove(cached);
+          if (cached.geometry) cached.geometry.dispose();
+          if (cached.material) cached.material.dispose();
+          existing.delete(part.id);
+        }
+        continue;
+      }
+      const isBinary = geomData.positions instanceof Float32Array;
       const geom = new THREE.BufferGeometry();
-      geom.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+      let positions;
+      if (isBinary) {
+        // Binary path: Float32Array is already in Three.js Y-up order, in
+        // object space (min corner at origin).
+        positions = geomData.positions;
+      } else if (Array.isArray(geomData.triangles)) {
+        // Legacy JSON path retained as a fallback when the binary endpoint
+        // is unavailable. World-space coordinates with placement baked in.
+        const tris = geomData.triangles;
+        positions = new Float32Array(tris.length * 9);
+        for (let i = 0; i < tris.length; i++) {
+          const t = tris[i];
+          const o = i * 9;
+          positions[o] = t[0][0]; positions[o + 1] = t[0][2]; positions[o + 2] = t[0][1];
+          positions[o + 3] = t[1][0]; positions[o + 4] = t[1][2]; positions[o + 5] = t[1][1];
+          positions[o + 6] = t[2][0]; positions[o + 7] = t[2][2]; positions[o + 8] = t[2][1];
+        }
+      } else {
+        continue;
+      }
+      geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
       geom.computeVertexNormals();
-      const mat = new THREE.MeshStandardMaterial({
-        color: 0x6fb7ff,
-        transparent: true,
-        opacity: 0.35,
-        side: THREE.DoubleSide,
-        depthWrite: false,
-      });
-      const mesh = new THREE.Mesh(geom, mat);
-      mesh.userData.partId = part.id;
-      // Store placement + triangle-space AABB so the part-drag handler can
-      // clamp to the bed without calling back into React state.
-      mesh.userData.placement = part.placement || null;
       geom.computeBoundingBox();
-      this.partsGroup.add(mesh);
+      let mesh = cached;
+      if (mesh) {
+        if (mesh.geometry) mesh.geometry.dispose();
+        mesh.geometry = geom;
+      } else {
+        const mat = new THREE.MeshStandardMaterial({
+          color: 0x6fb7ff,
+          transparent: true,
+          opacity: 0.35,
+          side: THREE.DoubleSide,
+          depthWrite: false,
+        });
+        mesh = new THREE.Mesh(geom, mat);
+        this.partsGroup.add(mesh);
+        existing.set(part.id, mesh);
+      }
+      mesh.userData.partId = part.id;
+      mesh.userData.placement = part.placement || null;
+      mesh.userData.shapeFingerprint = fingerprint;
+      mesh.userData.objectSpace = isBinary;
+      if (isBinary) {
+        this._applyPlacement(mesh, part.placement);
+      } else {
+        // Legacy: placement is baked into vertex coords; mesh.position is
+        // used only as a transient drag offset.
+        mesh.position.set(0, 0, 0);
+      }
+    }
+    this._partMeshes = existing;
+  }
+
+  // Translate `mesh` to its bed placement when geometry is in object space.
+  // Bed (x, y) maps to Three.js (x, z); bed Z stays on the bed plane.
+  _applyPlacement(mesh, placement) {
+    if (!mesh) return;
+    if (placement) {
+      mesh.position.set(placement.x, 0, placement.y);
+    } else {
+      mesh.position.set(0, 0, 0);
     }
   }
 
@@ -722,6 +834,38 @@ export class PrinterScene {
     });
     this._printedMat.resolution.set(resW, resH);
     this._printedVertCount = 0;
+    this._lastVisibleSegsBuilt = 0;
+
+    // Pre-bake the entire toolpath's positions and "settled" base+depth
+    // colors. setCursor only needs to memcpy the visible prefix and patch
+    // the trailing GLOW_SEGMENTS each frame instead of recomputing role
+    // palettes / Z-ramps for every segment from scratch — that drops a
+    // 100K-segment scrub from N float computes per frame to a constant
+    // GLOW_SEGMENTS-bounded patch on top of two TypedArray copies.
+    this._allPositions = ghostPositions;
+    this._settledColors = new Float32Array(segs.length * 6);
+    const zMinV = this._zMin;
+    const zRangeV = this._zRange;
+    for (let i = 0; i < segs.length; i++) {
+      const s = segs[i];
+      const baseRole = ROLE_BASE[s.role] || ROLE_DEFAULT;
+      const zNorm = Math.max(0, Math.min(1, (s.z - zMinV) / zRangeV));
+      const shift = zNorm - 0.5;
+      // Mid-print "settled" color: role + depth, no glow, no cooldown
+      // adjustments. setCursor blends the dynamic factors on top.
+      const liftAmt = shift > 0 ? shift * 2 * DEPTH_LIGHTEN : 0;
+      const sinkAmt = shift < 0 ? -shift * 2 * DEPTH_DARKEN : 0;
+      const r = baseRole[0] * (1 - sinkAmt) + (1 - baseRole[0]) * liftAmt;
+      const g = baseRole[1] * (1 - sinkAmt) + (1 - baseRole[1]) * liftAmt;
+      const b = baseRole[2] * (1 - sinkAmt) + (1 - baseRole[2]) * liftAmt;
+      const o = i * 6;
+      this._settledColors[o] = r;
+      this._settledColors[o + 1] = g;
+      this._settledColors[o + 2] = b;
+      this._settledColors[o + 3] = r;
+      this._settledColors[o + 4] = g;
+      this._settledColors[o + 5] = b;
+    }
 
     // FDM shows the nozzle cone; LPBF replaces it with the laser rig and
     // hides the cone (the active spot is rendered by the laser beam instead).
@@ -873,89 +1017,130 @@ export class PrinterScene {
   // LineSegments2 inside printedGroup. Pulled out of setCursor so the LPBF
   // end-of-sim cooldown can recolor the print (fading the GLOW_SEGMENTS hot
   // ramp toward zero) without re-running the full setCursor side effects.
+  //
+  // Fast path: when no cooldown blend is active (the dominant case during
+  // normal playback) the per-segment role/depth color is taken from the
+  // precomputed `_settledColors` buffer with a single TypedArray copy, and
+  // only the trailing GLOW_SEGMENTS need a hot-tip color patch. That keeps
+  // the per-frame work O(GLOW_SEGMENTS + visibleSegs memcpy) instead of
+  // O(visibleSegs × per-segment math).
   _rebuildPrintedGeometry(visibleSegs) {
     const segs = this._extrudeSegments || [];
     const pos = this._printedPositions;
     const col = this._printedColors;
     if (!pos || !col) return;
+    const allPositions = this._allPositions;
+    const settled = this._settledColors;
+
+    // Copy positions in one shot from the prebaked master buffer.
+    if (visibleSegs > 0 && allPositions) {
+      pos.set(allPositions.subarray(0, visibleSegs * 6));
+    }
+
+    const glow = this._glowFactor;
+    const settle = this._settleFactor;
+    // Only the LPBF cooldown actually shifts the role-base palette toward a
+    // metallic cool tone. FDM (and any LPBF state where glow=1, settle=0)
+    // can take the fast path that skips the per-segment role rewrite.
+    const coolingActive = this._printerType === 'LPBF' && (glow < 1 || settle > 0);
+
+    if (settled && !coolingActive) {
+      // Memcpy the precomputed role+depth colors for the visible window.
+      if (visibleSegs > 0) {
+        col.set(settled.subarray(0, visibleSegs * 6));
+      }
+      // Patch the trailing GLOW_SEGMENTS with the hot-tip ramp on top.
+      this._patchHotTip(col, visibleSegs, glow);
+    } else {
+      // Slow / cooldown path: full per-segment recompute, exactly as before.
+      this._fillPrintedColorsFull(segs, col, visibleSegs);
+    }
+
+    // Force the geometry to rebuild only when the segment count actually
+    // changed — pure-cooldown ticks with the same segment count fall into
+    // _fillPrintedColorsFull above and need a refresh; otherwise we can
+    // skip the LineSegments2 dispose/recreate dance entirely.
+    const lastBuilt = this._lastVisibleSegsBuilt ?? 0;
+    const segChanged = visibleSegs !== lastBuilt;
+    if (segChanged || coolingActive) {
+      this._disposeGroup(this.printedGroup);
+      this.printedGroup.clear();
+      if (visibleSegs > 0 && this._printedMat) {
+        // Fresh allocations so Three.js builds a clean InstancedInterleavedBuffer
+        // for this frame; attempting to swap buffers on an existing
+        // LineSegmentsGeometry produced stale renders in r0.162.
+        const posView = new Float32Array(pos.buffer, pos.byteOffset, visibleSegs * 6);
+        const colView = new Float32Array(col.buffer, col.byteOffset, visibleSegs * 6);
+        const geom = new LineSegmentsGeometry();
+        geom.setPositions(posView);
+        geom.setColors(colView);
+        const lines = new LineSegments2(geom, this._printedMat);
+        this.printedGroup.add(lines);
+      }
+    }
+    this._printedVertCount = visibleSegs * 2;
+  }
+
+  // Slow recompute used during the LPBF end-of-sim cooldown. Mirrors the
+  // legacy per-segment math (cool-mix + settle-dim + hot-tip ramp).
+  _fillPrintedColorsFull(segs, col, visibleSegs) {
     const zMin = this._zMin ?? 0;
     const zRange = this._zRange ?? 1;
     const glow = this._glowFactor;
-    // In LPBF mode, fade the warm role palette toward a metallic cool tone as
-    // the print cools. coolMix climbs from 0 (mid-print, full role color) to
-    // 1 (fully cooled, near-uniform LPBF_COOL_COLOR). FDM keeps its filament
-    // palette across the run.
     const coolMix = this._printerType === 'LPBF' ? 1 - glow : 0;
     const coolR = LPBF_COOL_COLOR[0];
     const coolG = LPBF_COOL_COLOR[1];
     const coolB = LPBF_COOL_COLOR[2];
-    // Phase-2 settle: drag colors further toward dim so the print reads as
-    // "room temp" once the cooldown completes. 20% (down from 35%) keeps the
-    // toolpath visible against the dark scene background — the lit part-mesh
-    // reveal at cooldown end carries the rest of the readability load. Only
-    // fires in LPBF mode; FDM never sets _settleFactor.
     const settleScale = 1 - 0.20 * this._settleFactor;
     for (let i = 0; i < visibleSegs; i++) {
       const s = segs[i];
       const o = i * 6;
-      pos[o] = s.ax; pos[o + 1] = s.ay; pos[o + 2] = s.az;
-      pos[o + 3] = s.bx; pos[o + 4] = s.by; pos[o + 5] = s.bz;
-
       const baseRole = ROLE_BASE[s.role] || ROLE_DEFAULT;
-      // Blend the role color toward the LPBF cool tone before the depth ramp
-      // so depth lighten/darken still applies on top — keeps geometry legible
-      // even when the part has fully cooled to a uniform metallic look.
       const baseR = baseRole[0] + (coolR - baseRole[0]) * coolMix;
       const baseG = baseRole[1] + (coolG - baseRole[1]) * coolMix;
       const baseB = baseRole[2] + (coolB - baseRole[2]) * coolMix;
-      // Normalize Z within the toolpath's own range; center at 0.5 so the
-      // mid-layers are unshifted and only the ceiling/floor get the extreme
-      // tints. shift ∈ [-0.5, +0.5].
       const zNorm = Math.max(0, Math.min(1, (s.z - zMin) / zRange));
       const shift = zNorm - 0.5;
-      // Lighten on top is what most easily pushes the print above the bloom
-      // threshold once the colors are otherwise cool, so scale it by the
-      // current glow level — at full cool there's no top-side brightening,
-      // and the print sits flat below bloom. Darken on the bottom is left at
-      // full strength so the part still has shape readability when cold.
       const liftAmt = shift > 0 ? shift * 2 * DEPTH_LIGHTEN * glow : 0;
       const sinkAmt = shift < 0 ? -shift * 2 * DEPTH_DARKEN : 0;
       let r = baseR * (1 - sinkAmt) + (1 - baseR) * liftAmt;
       let g = baseG * (1 - sinkAmt) + (1 - baseG) * liftAmt;
       let b = baseB * (1 - sinkAmt) + (1 - baseB) * liftAmt;
-
       const fromEnd = visibleSegs - 1 - i;
       if (fromEnd < GLOW_SEGMENTS && glow > 0) {
-        // _glowFactor scales the hot mix so the LPBF cooldown can fade the top
-        // of the print from glowing to its base color over a couple of seconds
-        // once the laser has shut off.
         const t = (1 - fromEnd / GLOW_SEGMENTS) * glow;
         r = r + (HOT_COLOR[0] - r) * t;
         g = g + (HOT_COLOR[1] - g) * t;
         b = b + (HOT_COLOR[2] - b) * t;
       }
-      // Final dim multiplier from the phase-2 settle. At settleScale=1 (any
-      // moment outside the settle phase) the colors pass through untouched.
       r *= settleScale; g *= settleScale; b *= settleScale;
       col[o] = r; col[o + 1] = g; col[o + 2] = b;
       col[o + 3] = r; col[o + 4] = g; col[o + 5] = b;
     }
+  }
 
-    this._disposeGroup(this.printedGroup);
-    this.printedGroup.clear();
-    if (visibleSegs > 0 && this._printedMat) {
-      // Fresh allocations so Three.js builds a clean InstancedInterleavedBuffer
-      // for this frame; attempting to swap buffers on an existing
-      // LineSegmentsGeometry produced stale renders in r0.162.
-      const posView = new Float32Array(pos.buffer, pos.byteOffset, visibleSegs * 6);
-      const colView = new Float32Array(col.buffer, col.byteOffset, visibleSegs * 6);
-      const geom = new LineSegmentsGeometry();
-      geom.setPositions(posView);
-      geom.setColors(colView);
-      const lines = new LineSegments2(geom, this._printedMat);
-      this.printedGroup.add(lines);
+  // Layer the hot-tip glow onto the `_settledColors`-seeded buffer for the
+  // most-recent GLOW_SEGMENTS window. This is the only per-frame color work
+  // during the common forward-playback case — bounded by GLOW_SEGMENTS, not
+  // by total segment count, so 100K-move toolpaths stay smooth.
+  _patchHotTip(col, visibleSegs, glow) {
+    if (glow <= 0 || visibleSegs <= 0) return;
+    const start = Math.max(0, visibleSegs - GLOW_SEGMENTS);
+    const settled = this._settledColors;
+    if (!settled) return;
+    for (let i = start; i < visibleSegs; i++) {
+      const o = i * 6;
+      const fromEnd = visibleSegs - 1 - i;
+      const t = (1 - fromEnd / GLOW_SEGMENTS) * glow;
+      const baseR = settled[o];
+      const baseG = settled[o + 1];
+      const baseB = settled[o + 2];
+      const r = baseR + (HOT_COLOR[0] - baseR) * t;
+      const g = baseG + (HOT_COLOR[1] - baseG) * t;
+      const b = baseB + (HOT_COLOR[2] - baseB) * t;
+      col[o] = r; col[o + 1] = g; col[o + 2] = b;
+      col[o + 3] = r; col[o + 4] = g; col[o + 5] = b;
     }
-    this._printedVertCount = visibleSegs * 2;
   }
 
   _beginCooldown() {

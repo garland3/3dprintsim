@@ -26,6 +26,17 @@ Three ways to drive it:
 
 ## Features
 
+- **Multi-format upload.** Drop `.stl` (binary or ASCII) or `.3mf` files
+  directly. STEP (`.step`/`.stp`) parses through an optional `cadquery` or
+  `trimesh` backend (`pip install cadquery` in the backend env to enable);
+  uploading a STEP file with no backend installed surfaces a 400 with an
+  install hint rather than failing opaquely.
+- **Big-file performant.** STL parsing, transforms, and validation run
+  through numpy in bulk; the slicer z-buckets triangles so each layer only
+  scans the ones that span it. Geometry crosses the wire as raw float32 in
+  Three.js Y-up order — a million-triangle mesh ships in ~36 MB instead of
+  150+ MB of JSON. Re-positioning a part is a single `mesh.position`
+  update on the frontend, with no refetch even for huge meshes.
 - **Real infill.** Rectilinear scan-line infill clipped to each layer's
   contours, configurable density, alternating direction + zig-zag routing.
 - **Solid top/bottom layers.** First `bottom_layers` and last `top_layers` of
