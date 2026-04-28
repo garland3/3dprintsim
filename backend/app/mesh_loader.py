@@ -18,7 +18,6 @@ Currently supported:
 from __future__ import annotations
 
 import io
-import struct
 import xml.etree.ElementTree as ET
 import zipfile
 from typing import Iterable
@@ -30,8 +29,14 @@ from .stl_loader import Mesh, _compute_aabb, parse_stl
 
 # ZIP local-file-header magic. 3MF and any other ZIP-based format starts here.
 _ZIP_MAGIC = b"PK\x03\x04"
-# STEP files are ASCII and always begin with the standard ISO header.
-_STEP_HEADER_PREFIXES = (b"ISO-10303-21", b"\xefISO-10303-21", b"FILE_DESCRIPTION")
+# STEP files are ASCII and always begin with the standard ISO header. Some
+# tools (especially Windows-side CAD exporters) prepend a UTF-8 BOM
+# (0xEF 0xBB 0xBF), so accept that prefix too.
+_STEP_HEADER_PREFIXES = (
+    b"ISO-10303-21",
+    b"\xef\xbb\xbfISO-10303-21",
+    b"FILE_DESCRIPTION",
+)
 
 
 def parse_mesh(data: bytes, filename: str = "") -> Mesh:
@@ -93,26 +98,28 @@ def parse_3mf(data: bytes) -> Mesh:
     same file) come in pre-arranged. Objects referenced multiple times yield
     one instance per ``<item>``.
     """
+    # `with` guarantees the ZipFile (and its in-memory BytesIO) gets closed
+    # even on parse failure — the BytesIO release is cheap, but tying
+    # lifetime to the function scope keeps ownership unambiguous.
     try:
-        zf = zipfile.ZipFile(io.BytesIO(data))
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            # The spec requires the model at `3D/3dmodel.model`, but some
+            # authoring tools tuck it elsewhere. Search for the first
+            # `.model` so we don't silently 400 on legitimate-but-quirky
+            # files.
+            model_name = None
+            for name in zf.namelist():
+                lname = name.lower()
+                if lname.endswith("3dmodel.model"):
+                    model_name = name
+                    break
+                if model_name is None and lname.endswith(".model"):
+                    model_name = name
+            if model_name is None:
+                raise ValueError("3MF archive missing a `.model` payload")
+            xml_bytes = zf.read(model_name)
     except zipfile.BadZipFile as exc:
         raise ValueError(f"not a valid 3MF/ZIP: {exc}") from exc
-
-    # The spec requires the model at `3D/3dmodel.model`, but some authoring
-    # tools tuck it elsewhere. Search for the first `.model` so we don't
-    # silently 400 on legitimate-but-quirky files.
-    model_name = None
-    for name in zf.namelist():
-        lname = name.lower()
-        if lname.endswith("3dmodel.model"):
-            model_name = name
-            break
-        if model_name is None and lname.endswith(".model"):
-            model_name = name
-    if model_name is None:
-        raise ValueError("3MF archive missing a `.model` payload")
-
-    xml_bytes = zf.read(model_name)
     try:
         root = ET.fromstring(xml_bytes)
     except ET.ParseError as exc:
@@ -145,7 +152,8 @@ def parse_3mf(data: bytes) -> Mesh:
         raise ValueError("3MF contains no usable mesh objects")
 
     # Build pass: each `<item>` references an object id and optionally a
-    # `transform` (3x4 row-major in 3MF, applied as a 4x4 affine).
+    # `transform` (12 floats interpreted here in column-major order and
+    # applied as a 4x4 affine — see _parse_3mf_transform for the layout).
     chunks: list[np.ndarray] = []
     build_node = _find(root, f"{_3MF_NS}build") or _find(root, "build")
     items: list[tuple[str, np.ndarray]] = []
@@ -164,6 +172,14 @@ def parse_3mf(data: bytes) -> Mesh:
     for oid, transform in items:
         verts, tris = objects[oid]
         # Vertices are stored per-object as (V, 3); triangles index into them.
+        # Validate the indices BEFORE the numpy gather — a malformed 3MF that
+        # references vertex 9999 in an 8-vertex object would otherwise raise
+        # IndexError, which the upload route doesn't translate to 400.
+        if tris.size and (tris.min() < 0 or tris.max() >= verts.shape[0]):
+            raise ValueError(
+                f"3MF object {oid!r} references out-of-range vertex indices "
+                f"(have {verts.shape[0]} vertices)"
+            )
         # Resolve indices, optionally apply the build transform, then keep
         # only triangle vertex coords (N, 3, 3).
         coords = verts[tris]  # (N, 3, 3)

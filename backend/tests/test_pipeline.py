@@ -176,6 +176,45 @@ def test_3mf_parse_directly():
     assert mesh.size == (20.0, 20.0, 20.0)
 
 
+def test_3mf_out_of_range_index_returns_400(client: TestClient):
+    """Malformed 3MF with out-of-range triangle indices should 400, not 500.
+
+    Regression: ``parse_3mf`` used ``verts[tris]`` without validating bounds;
+    a hostile/buggy 3MF could trip ``IndexError`` and leak as a 500 because
+    the upload route only translates ``ValueError``.
+    """
+    import io
+    import zipfile
+
+    model_xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<model unit="millimeter" '
+        'xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02">'
+        '<resources>'
+        '<object id="1" type="model"><mesh>'
+        '<vertices>'
+        '<vertex x="0" y="0" z="0"/>'
+        '<vertex x="1" y="0" z="0"/>'
+        '<vertex x="0" y="1" z="0"/>'
+        '</vertices>'
+        # Reference vertex 99 — well past the 3 we declared.
+        '<triangles><triangle v1="0" v2="1" v3="99"/></triangles>'
+        '</mesh></object>'
+        '</resources>'
+        '<build><item objectid="1"/></build>'
+        '</model>'
+    )
+    bio = io.BytesIO()
+    with zipfile.ZipFile(bio, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("3D/3dmodel.model", model_xml)
+    resp = client.post(
+        "/api/parts/upload",
+        files={"file": ("bad.3mf", bio.getvalue(), "model/3mf")},
+    )
+    assert resp.status_code == 400
+    assert "out-of-range" in resp.json()["detail"]
+
+
 def test_step_upload_without_backend_returns_clear_error(client: TestClient):
     """Uploading a STEP file with no STEP backend installed should 400 with
     an actionable error rather than a 500."""
