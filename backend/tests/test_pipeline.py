@@ -70,6 +70,25 @@ def test_printer_type_invalid_falls_back_to_fdm(monkeypatch):
     reset_service()
 
 
+def test_printer_dim_env_override(monkeypatch):
+    """`PRINTER_DIM=x,y,z` in the environment sets the default bed size."""
+    monkeypatch.setenv("PRINTER_DIM", "500,400,300")
+    reset_service()
+    app = create_app()
+    with TestClient(app) as c:
+        assert c.get("/api/state").json()["bed_size"] == [500.0, 400.0, 300.0]
+    reset_service()
+
+
+def test_printer_dim_invalid_falls_back_to_default(monkeypatch):
+    monkeypatch.setenv("PRINTER_DIM", "not,a,number")
+    reset_service()
+    app = create_app()
+    with TestClient(app) as c:
+        assert c.get("/api/state").json()["bed_size"] == [250.0, 210.0, 210.0]
+    reset_service()
+
+
 def test_set_bed_size(client: TestClient):
     r = client.post("/api/bed", json={"x": 200, "y": 200, "z": 200})
     assert r.status_code == 200

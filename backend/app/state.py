@@ -79,6 +79,45 @@ def _resolve_printer_type() -> str:
     return "FDM"
 
 
+def _resolve_bed_size() -> tuple[float, float, float]:
+    """Parse `PRINTER_DIM=x,y,z` (mm) from the environment.
+
+    Falls back to DEFAULT_BED on missing/blank/malformed values rather than
+    crashing — same forgiving policy as PRINTER_TYPE.
+    """
+    raw = os.getenv("PRINTER_DIM")
+    if raw is None or not raw.strip():
+        return DEFAULT_BED
+    parts = [p.strip() for p in raw.split(",")]
+    if len(parts) != 3:
+        import logging
+        logging.getLogger(__name__).warning(
+            "ignoring PRINTER_DIM=%r (expected 'x,y,z' in mm); using default %s",
+            raw,
+            DEFAULT_BED,
+        )
+        return DEFAULT_BED
+    try:
+        x, y, z = (float(p) for p in parts)
+    except ValueError:
+        import logging
+        logging.getLogger(__name__).warning(
+            "ignoring PRINTER_DIM=%r (non-numeric component); using default %s",
+            raw,
+            DEFAULT_BED,
+        )
+        return DEFAULT_BED
+    if x <= 0 or y <= 0 or z <= 0:
+        import logging
+        logging.getLogger(__name__).warning(
+            "ignoring PRINTER_DIM=%r (dimensions must be positive); using default %s",
+            raw,
+            DEFAULT_BED,
+        )
+        return DEFAULT_BED
+    return (x, y, z)
+
+
 @dataclass
 class Part:
     id: str
@@ -211,7 +250,7 @@ class PrinterService:
     def __init__(self, session_id: str | None = None) -> None:
         self._lock = threading.RLock()
         self.session_id = session_id or DEFAULT_SESSION_ID
-        self.bed_size: tuple[float, float, float] = DEFAULT_BED
+        self.bed_size: tuple[float, float, float] = _resolve_bed_size()
         # Printer technology — read at service construction so an env override
         # applied between sessions takes effect on the next session, but the
         # answer stays stable for the lifetime of any one PrinterService.
