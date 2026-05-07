@@ -68,9 +68,25 @@ DEFAULT_BED = (250.0, 210.0, 210.0)
 VALID_PRINTER_TYPES = ("FDM", "LPBF")
 
 
+def _strip_env_quotes(raw: str) -> str:
+    """Trim a single pair of matched surrounding quotes from an env value.
+
+    `app.env.load_dotenv` strips quotes when reading `.env` directly, but
+    podman's `--env-file` (used by `run.sh`) passes values through with their
+    quotes intact — so a `PRINTER_DIM="500,500,500"` line lands in the
+    container as the literal nine-character string `"500,500,500"`. Without
+    this, every `_resolve_*` parse below fails and silently falls back to the
+    default.
+    """
+    s = raw.strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in ('"', "'"):
+        return s[1:-1]
+    return s
+
+
 def _resolve_printer_type() -> str:
     raw = os.getenv("PRINTER_TYPE", "FDM")
-    normalized = (raw or "").strip().upper()
+    normalized = _strip_env_quotes(raw or "").upper()
     if normalized in VALID_PRINTER_TYPES:
         return normalized
     # Anything unrecognized (typo, blank) falls back to FDM rather than
@@ -87,6 +103,9 @@ def _resolve_bed_size() -> tuple[float, float, float]:
     """
     raw = os.getenv("PRINTER_DIM")
     if raw is None or not raw.strip():
+        return DEFAULT_BED
+    raw = _strip_env_quotes(raw)
+    if not raw:
         return DEFAULT_BED
     parts = [p.strip() for p in raw.split(",")]
     if len(parts) != 3:

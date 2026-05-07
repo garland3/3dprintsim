@@ -89,6 +89,29 @@ def test_printer_dim_invalid_falls_back_to_default(monkeypatch):
     reset_service()
 
 
+def test_printer_dim_quoted_value_is_unquoted(monkeypatch):
+    # podman's `--env-file` (used by run.sh) hands quoted values through
+    # to the container with the quotes intact, so a `.env` line written as
+    # `PRINTER_DIM="500,500,500"` lands here as the literal nine-char string
+    # — without unquoting, parsing fails and the bed silently reverts to the
+    # 250×210×210 default.
+    monkeypatch.setenv("PRINTER_DIM", '"500,500,500"')
+    reset_service()
+    app = create_app()
+    with TestClient(app) as c:
+        assert c.get("/api/state").json()["bed_size"] == [500.0, 500.0, 500.0]
+    reset_service()
+
+
+def test_printer_type_quoted_value_is_unquoted(monkeypatch):
+    monkeypatch.setenv("PRINTER_TYPE", '"LPBF"')
+    reset_service()
+    app = create_app()
+    with TestClient(app) as c:
+        assert c.get("/api/state").json()["printer_type"] == "LPBF"
+    reset_service()
+
+
 def test_set_bed_size(client: TestClient):
     r = client.post("/api/bed", json={"x": 200, "y": 200, "z": 200})
     assert r.status_code == 200
